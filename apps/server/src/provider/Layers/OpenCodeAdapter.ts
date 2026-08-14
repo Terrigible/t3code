@@ -8,6 +8,7 @@ import {
   RuntimeItemId,
   RuntimeRequestId,
   ThreadId,
+  type ThreadTokenUsageSnapshot,
   type ToolLifecycleItemType,
   TurnId,
   type UserInputQuestion,
@@ -180,6 +181,83 @@ function trimText(value: string | undefined | null): string | undefined {
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
 
+/**
+ * Token breakdown shape OpenCode attaches to assistant messages and session
+ * records (`AssistantMessage.tokens`). All counts are cumulative over the
+ * current context window, so the last assistant message's total approximates
+ * live window usage — the same computation the OpenCode web app performs
+ * (`tokenTotal(msg) / limit.context`).
+ */
+export interface OpenCodeAssistantTokenCounts {
+  readonly input: number;
+  readonly output: number;
+  readonly reasoning: number;
+  readonly cache: { readonly read: number; readonly write: number };
+}
+
+/**
+ * Total tokens an OpenCode message/session counted. Mirrors the OpenCode web
+ * app's `tokenTotal` — `input`, `output`, `reasoning`, `cache.read` and
+ * `cache.write` are disjoint counters (OpenCode reports `reasoning` outside
+ * `output`, unlike Codex/Claude where it is a subset), so they all sum.
+ */
+export function openCodeTokenTotal(tokens: OpenCodeAssistantTokenCounts): number {
+  return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write;
+}
+
+/**
+ * Cumulative tokens the OpenCode server has processed across the whole
+ * session (from the session record's `tokens`). Unlike the per-message
+ * totals this never resets on compaction, so it is the "total processed"
+ * figure the usage meter surfaces alongside the live window usage.
+ */
+export function openCodeSessionProcessedTotal(tokens: OpenCodeAssistantTokenCounts): number {
+  return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write;
+}
+
+/**
+ * Build a {@link ThreadTokenUsageSnapshot} from an OpenCode assistant
+ * message's cumulative token counts and the model's context window. Returns
+ * `undefined` when there is nothing to report (no tokens). `maxTokens` is
+ * only set when a real, positive context limit is known; OpenCode auto-compacts,
+ * so `compactsAutomatically` is always true.
+ */
+export function buildOpenCodeContextWindowUsage(input: {
+  readonly tokens: OpenCodeAssistantTokenCounts;
+  readonly modelContextWindow?: number | null | undefined;
+  readonly totalProcessedTokens?: number | undefined;
+}): ThreadTokenUsageSnapshot | undefined {
+  const usedTokens = openCodeTokenTotal(input.tokens);
+  if (usedTokens <= 0) {
+    return undefined;
+  }
+
+  const modelContextWindow =
+    typeof input.modelContextWindow === "number" &&
+    Number.isFinite(input.modelContextWindow) &&
+    input.modelContextWindow > 0
+      ? input.modelContextWindow
+      : undefined;
+
+  return {
+    usedTokens,
+    ...(input.totalProcessedTokens !== undefined && input.totalProcessedTokens > usedTokens
+      ? { totalProcessedTokens: input.totalProcessedTokens }
+      : {}),
+    ...(modelContextWindow !== undefined ? { maxTokens: modelContextWindow } : {}),
+    inputTokens: input.tokens.input,
+    cachedInputTokens: input.tokens.cache.read,
+    outputTokens: input.tokens.output,
+    reasoningOutputTokens: input.tokens.reasoning,
+    lastUsedTokens: usedTokens,
+    lastInputTokens: input.tokens.input,
+    lastCachedInputTokens: input.tokens.cache.read,
+    lastOutputTokens: input.tokens.output,
+    lastReasoningOutputTokens: input.tokens.reasoning,
+    compactsAutomatically: true,
+  };
+}
+
 function openCodeEventSessionId(event: OpenCodeSubscribedEvent): string | undefined {
   const properties = "properties" in event ? event.properties : undefined;
   if (!properties || typeof properties !== "object") {
@@ -234,6 +312,21 @@ interface OpenCodeSessionContext {
   readonly emittedTextByPartId: Map<string, string>;
   readonly completedAssistantPartIds: Set<string>;
   readonly turns: Array<OpenCodeTurnSnapshot>;
+  /**
+   * Lazily populated `providerID/modelID` → model context window (tokens),
+   * sourced from the OpenCode `config.providers` endpoint. `null` means the
+   * model has no known limit (e.g. user-defined models without metadata).
+   * Guarded by {@link OpenCodeSessionContext.modelContextWindowCacheLoaded}
+   * so a failed fetch is not retried on every message.
+   */
+  readonly modelContextWindowCache: Map<string, number | null>;
+  modelContextWindowCacheLoaded: boolean;
+  /**
+   * Latest session-level cumulative token counts, captured from
+   * `session.updated` events. Never resets on compaction, so it feeds the
+   * "total processed" figure.
+   */
+  sessionTokenTotals: OpenCodeAssistantTokenCounts | undefined;
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
   activeVariant: string | undefined;
@@ -683,6 +776,89 @@ export function makeOpenCodeAdapter(
       },
     ) => writeNativeEvent(threadId, event).pipe(Effect.catchCause(() => Effect.void));
 
+    /**
+     * Resolve a model's context window (tokens) from the cache populated by
+     * {@link loadModelContextWindows}. Pure and synchronous so it is safe to
+     * call from the event-pump fiber — no network round-trip can stall
+     * streaming. Returns `null` when the model has no known limit.
+     */
+    const resolveModelContextWindow = (
+      context: OpenCodeSessionContext,
+      providerID: string,
+      modelID: string,
+    ): number | null => context.modelContextWindowCache.get(`${providerID}/${modelID}`) ?? null;
+
+    /**
+     * Populate the model context-window cache from the OpenCode
+     * `config.providers` endpoint — the same source the OpenCode web app uses
+     * for its context-usage indicator. The provider list is static config, so
+     * it is fetched once per session, eagerly at session start (before the
+     * event pump forks) rather than from inside the pump. A failed fetch is
+     * recorded as loaded-with-empty-cache so it is not retried; the meter then
+     * degrades to showing token counts without a percentage.
+     */
+    const loadModelContextWindows = Effect.fn("loadModelContextWindows")(function* (
+      context: OpenCodeSessionContext,
+    ) {
+      if (context.modelContextWindowCacheLoaded) {
+        return;
+      }
+      context.modelContextWindowCacheLoaded = true;
+      const providersExit = yield* runOpenCodeSdk("config.providers", () =>
+        context.client.config.providers(),
+      ).pipe(Effect.exit);
+      if (!Exit.isSuccess(providersExit)) {
+        return;
+      }
+      for (const provider of providersExit.value.data?.providers ?? []) {
+        for (const [modelId, model] of Object.entries(provider.models ?? {})) {
+          const contextWindow = model.limit?.context;
+          context.modelContextWindowCache.set(
+            `${provider.id}/${modelId}`,
+            typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0
+              ? contextWindow
+              : null,
+          );
+        }
+      }
+    });
+
+    /**
+     * Emit a `thread.token-usage.updated` event from an OpenCode assistant
+     * message's cumulative token counts. No-op when the message carries no
+     * tokens (`usedTokens <= 0`), matching the ingestion filter that turns
+     * these events into `context-window.updated` activities.
+     */
+    const emitContextWindowUsage = Effect.fn("emitContextWindowUsage")(function* (
+      context: OpenCodeSessionContext,
+      tokens: OpenCodeAssistantTokenCounts,
+      providerID: string,
+      modelID: string,
+      turnId: TurnId | undefined,
+      raw: unknown,
+    ) {
+      const usage = buildOpenCodeContextWindowUsage({
+        tokens,
+        modelContextWindow: resolveModelContextWindow(context, providerID, modelID),
+        totalProcessedTokens:
+          context.sessionTokenTotals === undefined
+            ? undefined
+            : openCodeSessionProcessedTotal(context.sessionTokenTotals),
+      });
+      if (usage === undefined) {
+        return;
+      }
+      yield* emit({
+        ...(yield* buildEventBase({
+          threadId: context.session.threadId,
+          turnId,
+          raw,
+        })),
+        type: "thread.token-usage.updated",
+        payload: { usage },
+      });
+    });
+
     const emitUnexpectedExit = Effect.fn("emitUnexpectedExit")(function* (
       context: OpenCodeSessionContext,
       message: string,
@@ -839,6 +1015,20 @@ export function makeOpenCodeAdapter(
               },
             });
           }
+          // Capture session-level cumulative token totals so the usage meter
+          // can show "total processed" alongside the live window usage.
+          const sessionTokens = event.properties.info.tokens;
+          if (sessionTokens !== undefined && sessionTokens !== null) {
+            context.sessionTokenTotals = {
+              input: sessionTokens.input,
+              output: sessionTokens.output,
+              reasoning: sessionTokens.reasoning,
+              cache: {
+                read: sessionTokens.cache.read,
+                write: sessionTokens.cache.write,
+              },
+            };
+          }
           break;
         }
 
@@ -850,6 +1040,18 @@ export function makeOpenCodeAdapter(
                 continue;
               }
               yield* emitAssistantTextDelta(context, part, turnId, event);
+            }
+            // Assistant messages carry cumulative context-window token counts
+            // once complete; surface them as the live usage snapshot.
+            if (event.properties.info.tokens !== undefined) {
+              yield* emitContextWindowUsage(
+                context,
+                event.properties.info.tokens,
+                event.properties.info.providerID,
+                event.properties.info.modelID,
+                turnId,
+                event,
+              );
             }
           }
           break;
@@ -1399,6 +1601,9 @@ export function makeOpenCodeAdapter(
           messageRoleById: new Map(),
           completedAssistantPartIds: new Set(),
           turns: [],
+          modelContextWindowCache: new Map(),
+          modelContextWindowCacheLoaded: false,
+          sessionTokenTotals: undefined,
           activeTurnId: undefined,
           activeAgent: undefined,
           activeVariant: undefined,
@@ -1406,6 +1611,9 @@ export function makeOpenCodeAdapter(
           sessionScope: started.sessionScope,
         };
         sessions.set(input.threadId, context);
+        // Populate the model context-window cache before the event pump forks
+        // so token-usage emissions never block streaming on a network fetch.
+        yield* loadModelContextWindows(context).pipe(Effect.ignore);
         yield* startEventPump(context);
 
         yield* emit({

@@ -33,10 +33,12 @@ import {
 } from "../opencodeRuntime.ts";
 import {
   appendOpenCodeAssistantTextDelta,
+  buildOpenCodeContextWindowUsage,
   isOpenCodeNotFound,
   isSameOpenCodeDirectory,
   makeOpenCodeAdapter,
   mergeOpenCodeAssistantText,
+  openCodeTokenTotal,
 } from "./OpenCodeAdapter.ts";
 
 // Test-local service tag so the rest of the file can keep using `yield* OpenCodeAdapter`.
@@ -68,6 +70,10 @@ const runtimeMock = {
     closeError: null as Error | null,
     messages: [] as MessageEntry[],
     subscribedEvents: [] as unknown[],
+    configProviders: null as null | {
+      providers: Array<{ id: string; models: Record<string, unknown> }>;
+    },
+    configProvidersError: null as Error | null,
     sessionGetIds: [] as string[],
     missingSessionIds: new Set<string>(),
     transientErrorSessionIds: new Set<string>(),
@@ -88,6 +94,8 @@ const runtimeMock = {
     this.state.closeError = null;
     this.state.messages = [];
     this.state.subscribedEvents = [];
+    this.state.configProviders = null;
+    this.state.configProvidersError = null;
     this.state.sessionGetIds.length = 0;
     this.state.missingSessionIds.clear();
     this.state.transientErrorSessionIds.clear();
@@ -211,6 +219,19 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
             }
           })(),
         }),
+      },
+      config: {
+        providers: async () => {
+          if (runtimeMock.state.configProvidersError) {
+            throw runtimeMock.state.configProvidersError;
+          }
+          return {
+            data: {
+              providers: runtimeMock.state.configProviders?.providers ?? [],
+              default: {},
+            },
+          };
+        },
       },
     }) as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
   loadOpenCodeInventory: () =>
@@ -1190,7 +1211,6 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       }
     }),
   );
-
   it.effect("passes the thread title to session.create when provided", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
@@ -1254,6 +1274,249 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.equal(metadataUpdated.length, 1);
       if (metadataUpdated[0]?.type === "thread.metadata.updated") {
         NodeAssert.equal(metadataUpdated[0].payload.name, "Investigate reconnect failures");
+      }
+    }),
+  );
+
+  it.effect("builds a context-window usage snapshot from OpenCode token counts", () =>
+    Effect.sync(() => {
+      const tokens = {
+        input: 4000,
+        output: 200,
+        reasoning: 50,
+        cache: { read: 1000, write: 300 },
+      };
+      NodeAssert.equal(openCodeTokenTotal(tokens), 5550);
+
+      const withWindow = buildOpenCodeContextWindowUsage({
+        tokens,
+        modelContextWindow: 200_000,
+        totalProcessedTokens: 6_550,
+      });
+      NodeAssert.deepEqual(withWindow, {
+        usedTokens: 5550,
+        totalProcessedTokens: 6550,
+        maxTokens: 200000,
+        inputTokens: 4000,
+        cachedInputTokens: 1000,
+        outputTokens: 200,
+        reasoningOutputTokens: 50,
+        lastUsedTokens: 5550,
+        lastInputTokens: 4000,
+        lastCachedInputTokens: 1000,
+        lastOutputTokens: 200,
+        lastReasoningOutputTokens: 50,
+        compactsAutomatically: true,
+      });
+
+      const withoutWindow = buildOpenCodeContextWindowUsage({ tokens });
+      NodeAssert.equal("maxTokens" in withoutWindow!, false);
+
+      const withoutProcessed = buildOpenCodeContextWindowUsage({
+        tokens,
+        totalProcessedTokens: 5550,
+      });
+      NodeAssert.equal("totalProcessedTokens" in withoutProcessed!, false);
+
+      const zeroTokens = buildOpenCodeContextWindowUsage({
+        tokens: {
+          input: 0,
+          output: 0,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+        modelContextWindow: 200_000,
+      });
+      NodeAssert.equal(zeroTokens, undefined);
+    }),
+  );
+
+  it.effect("emits thread token usage from assistant message tokens", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-token-usage");
+      runtimeMock.state.configProviders = {
+        providers: [
+          {
+            id: "opencode",
+            models: {
+              "gpt-5.4": { limit: { context: 200_000, output: 16_384 } },
+            },
+          },
+        ],
+      };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "session.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "http://127.0.0.1:9999/session",
+              title: "Token usage",
+              tokens: {
+                input: 5000,
+                output: 200,
+                reasoning: 50,
+                cache: { read: 1000, write: 300 },
+              },
+            },
+          },
+        },
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-token-usage",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: {
+                input: 4000,
+                output: 200,
+                reasoning: 50,
+                cache: { read: 1000, write: 300 },
+              },
+            },
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(4),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const usageEvent = events.find((event) => event.type === "thread.token-usage.updated");
+      NodeAssert.ok(usageEvent);
+      if (usageEvent.type === "thread.token-usage.updated") {
+        const usage = usageEvent.payload.usage;
+        NodeAssert.equal(usage.usedTokens, 5550);
+        NodeAssert.equal(usage.maxTokens, 200000);
+        NodeAssert.equal(usage.inputTokens, 4000);
+        NodeAssert.equal(usage.cachedInputTokens, 1000);
+        NodeAssert.equal(usage.outputTokens, 200);
+        NodeAssert.equal(usage.reasoningOutputTokens, 50);
+        NodeAssert.equal(usage.lastUsedTokens, 5550);
+        NodeAssert.equal(usage.totalProcessedTokens, 6550);
+        NodeAssert.equal(usage.compactsAutomatically, true);
+      }
+    }),
+  );
+
+  it.effect("emits thread token usage without a max when the model limit is unknown", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-token-usage-unknown");
+      runtimeMock.state.configProviders = {
+        providers: [
+          {
+            id: "opencode",
+            models: {
+              "custom-model": { limit: { context: 0, output: 4096 } },
+            },
+          },
+        ],
+      };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-token-usage-unknown",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "custom-model",
+              tokens: {
+                input: 1000,
+                output: 100,
+                reasoning: 10,
+                cache: { read: 200, write: 50 },
+              },
+            },
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const usageEvent = events.find((event) => event.type === "thread.token-usage.updated");
+      NodeAssert.ok(usageEvent);
+      if (usageEvent.type === "thread.token-usage.updated") {
+        NodeAssert.equal(usageEvent.payload.usage.usedTokens, 1360);
+        NodeAssert.equal("maxTokens" in usageEvent.payload.usage, false);
+        NodeAssert.equal("totalProcessedTokens" in usageEvent.payload.usage, false);
+      }
+    }),
+  );
+
+  it.effect("keeps emitting token usage when the model catalog fetch fails", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-token-usage-catalog-fail");
+      runtimeMock.state.configProvidersError = new Error("catalog down");
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-token-usage-catalog-fail",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: {
+                input: 2000,
+                output: 100,
+                reasoning: 0,
+                cache: { read: 400, write: 100 },
+              },
+            },
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const usageEvent = events.find((event) => event.type === "thread.token-usage.updated");
+      NodeAssert.ok(usageEvent);
+      if (usageEvent.type === "thread.token-usage.updated") {
+        NodeAssert.equal(usageEvent.payload.usage.usedTokens, 2600);
+        NodeAssert.equal("maxTokens" in usageEvent.payload.usage, false);
       }
     }),
   );
