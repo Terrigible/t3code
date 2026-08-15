@@ -862,16 +862,18 @@ export function makeOpenCodeAdapter(
 
     /**
      * Populate the context-usage metadata (model context windows + the
-     * auto-compaction flag) from the OpenCode config endpoints. Both reads
-     * are static config, fetched on demand — lazily on the first
-     * token-bearing message rather than at session start, mirroring how the
-     * Claude adapter queries context usage during result processing. The
-     * pump is sequential, so that first emission waits once per session,
-     * bounded by `OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS`; later events
-     * read the cache. A failed or timed-out fetch is recorded as
-     * loaded-with-empty-cache so it is not retried; the meter then degrades
-     * to showing token counts without a percentage, and the auto-compaction
-     * flag keeps its `true` default.
+     * auto-compaction flag) from the OpenCode config endpoints, scoped to the
+     * session's directory so an externally-launched server reports the
+     * project's config rather than its own cwd. Both reads are static config,
+     * fetched on demand — lazily on the first token-bearing message rather
+     * than at session start, mirroring how the Claude adapter queries context
+     * usage during result processing. The pump is sequential, so that first
+     * emission waits once per session, bounded by
+     * `OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS`; later events read the
+     * cache. A failed or timed-out fetch is recorded as loaded-with-empty-cache
+     * so it is not retried; the meter then degrades to showing token counts
+     * without a percentage, and the auto-compaction flag keeps its `true`
+     * default.
      */
     const loadContextUsageMetadata = Effect.fn("loadContextUsageMetadata")(function* (
       context: OpenCodeSessionContext,
@@ -882,10 +884,12 @@ export function makeOpenCodeAdapter(
       context.modelContextWindowCacheLoaded = true;
       const metadata = yield* Effect.all(
         [
-          runOpenCodeSdk("config.providers", () => context.client.config.providers()).pipe(
-            Effect.exit,
-          ),
-          runOpenCodeSdk("config.get", () => context.client.config.get()).pipe(Effect.exit),
+          runOpenCodeSdk("config.providers", () =>
+            context.client.config.providers({ directory: context.directory }),
+          ).pipe(Effect.exit),
+          runOpenCodeSdk("config.get", () =>
+            context.client.config.get({ directory: context.directory }),
+          ).pipe(Effect.exit),
         ],
         { concurrency: "unbounded" },
       ).pipe(Effect.timeoutOption(OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS));

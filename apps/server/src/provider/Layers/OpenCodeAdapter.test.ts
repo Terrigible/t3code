@@ -77,6 +77,7 @@ const runtimeMock = {
     configProvidersError: null as Error | null,
     configGet: null as null | Record<string, unknown>,
     configGetError: null as Error | null,
+    configProbeDirectories: [] as string[],
     sessionGetIds: [] as string[],
     missingSessionIds: new Set<string>(),
     transientErrorSessionIds: new Set<string>(),
@@ -101,6 +102,7 @@ const runtimeMock = {
     this.state.configProvidersError = null;
     this.state.configGet = null;
     this.state.configGetError = null;
+    this.state.configProbeDirectories.length = 0;
     this.state.sessionGetIds.length = 0;
     this.state.missingSessionIds.clear();
     this.state.transientErrorSessionIds.clear();
@@ -226,7 +228,8 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         }),
       },
       config: {
-        providers: async () => {
+        providers: async ({ directory }: { directory?: string }) => {
+          runtimeMock.state.configProbeDirectories.push(directory ?? "");
           if (runtimeMock.state.configProvidersError) {
             throw runtimeMock.state.configProvidersError;
           }
@@ -237,7 +240,8 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
             },
           };
         },
-        get: async () => {
+        get: async ({ directory }: { directory?: string }) => {
+          runtimeMock.state.configProbeDirectories.push(directory ?? "");
           if (runtimeMock.state.configGetError) {
             throw runtimeMock.state.configGetError;
           }
@@ -1497,6 +1501,10 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         NodeAssert.equal("totalProcessedTokens" in usage, false);
         NodeAssert.equal(usage.compactsAutomatically, true);
       }
+      NodeAssert.deepEqual(runtimeMock.state.configProbeDirectories, [
+        process.cwd(),
+        process.cwd(),
+      ]);
     }),
   );
 
