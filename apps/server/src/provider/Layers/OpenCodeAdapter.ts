@@ -182,10 +182,10 @@ function trimText(value: string | undefined | null): string | undefined {
 }
 
 /**
- * Token breakdown shape OpenCode attaches to assistant messages and session
- * records (`AssistantMessage.tokens`). All counts are cumulative over the
- * current context window, so the last assistant message's total approximates
- * live window usage — the same computation the OpenCode web app performs
+ * Token breakdown shape OpenCode attaches to assistant messages
+ * (`AssistantMessage.tokens`). All counts are cumulative over the current
+ * context window, so the last assistant message's total approximates live
+ * window usage — the same computation the OpenCode web app performs
  * (`tokenTotal(msg) / limit.context`).
  */
 export interface OpenCodeAssistantTokenCounts {
@@ -196,22 +196,12 @@ export interface OpenCodeAssistantTokenCounts {
 }
 
 /**
- * Total tokens an OpenCode message/session counted. Mirrors the OpenCode web
- * app's `tokenTotal` — `input`, `output`, `reasoning`, `cache.read` and
+ * Total tokens an OpenCode message counted. Mirrors the OpenCode web app's
+ * `tokenTotal` — `input`, `output`, `reasoning`, `cache.read` and
  * `cache.write` are disjoint counters (OpenCode reports `reasoning` outside
  * `output`, unlike Codex/Claude where it is a subset), so they all sum.
  */
 export function openCodeTokenTotal(tokens: OpenCodeAssistantTokenCounts): number {
-  return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write;
-}
-
-/**
- * Cumulative tokens the OpenCode server has processed across the whole
- * session (from the session record's `tokens`). Unlike the per-message
- * totals this never resets on compaction, so it is the "total processed"
- * figure the usage meter surfaces alongside the live window usage.
- */
-export function openCodeSessionProcessedTotal(tokens: OpenCodeAssistantTokenCounts): number {
   return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write;
 }
 
@@ -225,7 +215,6 @@ export function openCodeSessionProcessedTotal(tokens: OpenCodeAssistantTokenCoun
 export function buildOpenCodeContextWindowUsage(input: {
   readonly tokens: OpenCodeAssistantTokenCounts;
   readonly modelContextWindow?: number | null | undefined;
-  readonly totalProcessedTokens?: number | undefined;
 }): ThreadTokenUsageSnapshot | undefined {
   const usedTokens = openCodeTokenTotal(input.tokens);
   if (usedTokens <= 0) {
@@ -241,9 +230,6 @@ export function buildOpenCodeContextWindowUsage(input: {
 
   return {
     usedTokens,
-    ...(input.totalProcessedTokens !== undefined && input.totalProcessedTokens > usedTokens
-      ? { totalProcessedTokens: input.totalProcessedTokens }
-      : {}),
     ...(modelContextWindow !== undefined ? { maxTokens: modelContextWindow } : {}),
     inputTokens: input.tokens.input,
     cachedInputTokens: input.tokens.cache.read,
@@ -296,20 +282,15 @@ interface OpenCodeSessionContext {
   readonly completedAssistantPartIds: Set<string>;
   readonly turns: Array<OpenCodeTurnSnapshot>;
   /**
-   * Lazily populated `providerID/modelID` → model context window (tokens),
-   * sourced from the OpenCode `config.providers` endpoint. `null` means the
-   * model has no known limit (e.g. user-defined models without metadata).
-   * Guarded by {@link OpenCodeSessionContext.modelContextWindowCacheLoaded}
-   * so a failed fetch is not retried on every message.
+   * `providerID/modelID` → model context window (tokens), populated once per
+   * session from the OpenCode `config.providers` endpoint by
+   * {@link loadModelContextWindows}. `null` means the model has no known
+   * limit (e.g. user-defined models without metadata). Once
+   * {@link OpenCodeSessionContext.modelContextWindowCacheLoaded} is set, the
+   * cache is considered final — a failed fetch is not retried.
    */
   readonly modelContextWindowCache: Map<string, number | null>;
   modelContextWindowCacheLoaded: boolean;
-  /**
-   * Latest session-level cumulative token counts, captured from
-   * `session.updated` events. Never resets on compaction, so it feeds the
-   * "total processed" figure.
-   */
-  sessionTokenTotals: OpenCodeAssistantTokenCounts | undefined;
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
   activeVariant: string | undefined;
@@ -823,10 +804,6 @@ export function makeOpenCodeAdapter(
       const usage = buildOpenCodeContextWindowUsage({
         tokens,
         modelContextWindow: resolveModelContextWindow(context, providerID, modelID),
-        totalProcessedTokens:
-          context.sessionTokenTotals === undefined
-            ? undefined
-            : openCodeSessionProcessedTotal(context.sessionTokenTotals),
       });
       if (usage === undefined) {
         return;
@@ -997,20 +974,6 @@ export function makeOpenCodeAdapter(
                 },
               },
             });
-          }
-          // Capture session-level cumulative token totals so the usage meter
-          // can show "total processed" alongside the live window usage.
-          const sessionTokens = event.properties.info.tokens;
-          if (sessionTokens !== undefined && sessionTokens !== null) {
-            context.sessionTokenTotals = {
-              input: sessionTokens.input,
-              output: sessionTokens.output,
-              reasoning: sessionTokens.reasoning,
-              cache: {
-                read: sessionTokens.cache.read,
-                write: sessionTokens.cache.write,
-              },
-            };
           }
           break;
         }
@@ -1585,7 +1548,6 @@ export function makeOpenCodeAdapter(
           turns: [],
           modelContextWindowCache: new Map(),
           modelContextWindowCacheLoaded: false,
-          sessionTokenTotals: undefined,
           activeTurnId: undefined,
           activeAgent: undefined,
           activeVariant: undefined,

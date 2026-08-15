@@ -1225,11 +1225,9 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const withWindow = buildOpenCodeContextWindowUsage({
         tokens,
         modelContextWindow: 200_000,
-        totalProcessedTokens: 6_550,
       });
       NodeAssert.deepEqual(withWindow, {
         usedTokens: 5550,
-        totalProcessedTokens: 6550,
         maxTokens: 200000,
         inputTokens: 4000,
         cachedInputTokens: 1000,
@@ -1245,12 +1243,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
 
       const withoutWindow = buildOpenCodeContextWindowUsage({ tokens });
       NodeAssert.equal("maxTokens" in withoutWindow!, false);
-
-      const withoutProcessed = buildOpenCodeContextWindowUsage({
-        tokens,
-        totalProcessedTokens: 5550,
-      });
-      NodeAssert.equal("totalProcessedTokens" in withoutProcessed!, false);
+      NodeAssert.equal("totalProcessedTokens" in withoutWindow!, false);
 
       const zeroTokens = buildOpenCodeContextWindowUsage({
         tokens: {
@@ -1281,22 +1274,6 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       };
       runtimeMock.state.subscribedEvents = [
         {
-          type: "session.updated",
-          properties: {
-            sessionID: "http://127.0.0.1:9999/session",
-            info: {
-              id: "http://127.0.0.1:9999/session",
-              title: "Token usage",
-              tokens: {
-                input: 5000,
-                output: 200,
-                reasoning: 50,
-                cache: { read: 1000, write: 300 },
-              },
-            },
-          },
-        },
-        {
           type: "message.updated",
           properties: {
             sessionID: "http://127.0.0.1:9999/session",
@@ -1318,7 +1295,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
 
       const eventsFiber = yield* adapter.streamEvents.pipe(
         Stream.filter((event) => event.threadId === threadId),
-        Stream.take(4),
+        Stream.take(3),
         Stream.runCollect,
         Effect.forkChild,
       );
@@ -1341,7 +1318,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         NodeAssert.equal(usage.outputTokens, 200);
         NodeAssert.equal(usage.reasoningOutputTokens, 50);
         NodeAssert.equal(usage.lastUsedTokens, 5550);
-        NodeAssert.equal(usage.totalProcessedTokens, 6550);
+        NodeAssert.equal("totalProcessedTokens" in usage, false);
         NodeAssert.equal(usage.compactsAutomatically, true);
       }
     }),
