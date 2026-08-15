@@ -1387,6 +1387,26 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         },
       });
       NodeAssert.equal(allMalformed, undefined);
+
+      NodeAssert.equal(openCodeTokenTotal(null), 0);
+      NodeAssert.equal(openCodeTokenTotal(undefined), 0);
+
+      const missingBreakdown = buildOpenCodeContextWindowUsage({
+        tokens: { input: 1200, output: 300 },
+        modelContextWindow: 200_000,
+      });
+      NodeAssert.equal(missingBreakdown!.usedTokens, 1500);
+      NodeAssert.equal(missingBreakdown!.maxTokens, 200000);
+      NodeAssert.equal(missingBreakdown!.cachedInputTokens, 0);
+      NodeAssert.equal(missingBreakdown!.reasoningOutputTokens, 0);
+
+      NodeAssert.equal(
+        buildOpenCodeContextWindowUsage({
+          tokens: null,
+          modelContextWindow: 200_000,
+        }),
+        undefined,
+      );
     }),
   );
 
@@ -1477,6 +1497,70 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         NodeAssert.equal("totalProcessedTokens" in usage, false);
         NodeAssert.equal(usage.compactsAutomatically, true);
       }
+    }),
+  );
+
+  it.effect("keeps the session alive when the token breakdown is malformed", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-token-usage-partial");
+      runtimeMock.state.configProviders = {
+        providers: [
+          {
+            id: "opencode",
+            models: {
+              "gpt-5.4": { limit: { context: 200_000, output: 16_384 } },
+            },
+          },
+        ],
+      };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-token-usage-partial",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: {
+                input: 1000,
+                output: 100,
+              },
+            },
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const usageEvent = events.find((event) => event.type === "thread.token-usage.updated");
+      NodeAssert.ok(usageEvent);
+      if (usageEvent.type === "thread.token-usage.updated") {
+        NodeAssert.equal(usageEvent.payload.usage.usedTokens, 1100);
+        NodeAssert.equal(usageEvent.payload.usage.maxTokens, 200000);
+        NodeAssert.equal(usageEvent.payload.usage.cachedInputTokens, 0);
+        NodeAssert.equal(usageEvent.payload.usage.reasoningOutputTokens, 0);
+      }
+      // A throw inside the pump would surface as session.exited instead of
+      // the usage event; assert the session survived the malformed shape.
+      NodeAssert.equal(
+        events.some((event) => event.type === "session.exited"),
+        false,
+      );
     }),
   );
 
