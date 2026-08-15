@@ -209,12 +209,15 @@ export function openCodeTokenTotal(tokens: OpenCodeAssistantTokenCounts): number
  * Build a {@link ThreadTokenUsageSnapshot} from an OpenCode assistant
  * message's cumulative token counts and the model's context window. Returns
  * `undefined` when there is nothing to report (no tokens). `maxTokens` is
- * only set when a real, positive context limit is known; OpenCode auto-compacts,
- * so `compactsAutomatically` is always true.
+ * only set when a real, positive context limit is known. `compactsAutomatically`
+ * defaults to `true` — OpenCode auto-compacts unless the config explicitly
+ * disables it — and is surfaced so the meter can label the auto-compaction
+ * behavior honestly.
  */
 export function buildOpenCodeContextWindowUsage(input: {
   readonly tokens: OpenCodeAssistantTokenCounts;
   readonly modelContextWindow?: number | null | undefined;
+  readonly compactsAutomatically?: boolean | undefined;
 }): ThreadTokenUsageSnapshot | undefined {
   const usedTokens = openCodeTokenTotal(input.tokens);
   if (usedTokens <= 0) {
@@ -240,7 +243,7 @@ export function buildOpenCodeContextWindowUsage(input: {
     lastCachedInputTokens: input.tokens.cache.read,
     lastOutputTokens: input.tokens.output,
     lastReasoningOutputTokens: input.tokens.reasoning,
-    compactsAutomatically: true,
+    compactsAutomatically: input.compactsAutomatically ?? true,
   };
 }
 
@@ -284,13 +287,20 @@ interface OpenCodeSessionContext {
   /**
    * `providerID/modelID` → model context window (tokens), populated once per
    * session from the OpenCode `config.providers` endpoint by
-   * {@link loadModelContextWindows}. `null` means the model has no known
+   * {@link loadContextUsageMetadata}. `null` means the model has no known
    * limit (e.g. user-defined models without metadata). Once
    * {@link OpenCodeSessionContext.modelContextWindowCacheLoaded} is set, the
    * cache is considered final — a failed fetch is not retried.
    */
   readonly modelContextWindowCache: Map<string, number | null>;
   modelContextWindowCacheLoaded: boolean;
+  /**
+   * Whether the OpenCode session auto-compacts its context. Read from the
+   * config `compaction.auto` setting by {@link loadContextUsageMetadata} and
+   * defaults to `true` — OpenCode auto-compacts unless the config explicitly
+   * sets `compaction.auto: false`.
+   */
+  compactsAutomatically: boolean;
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
   activeVariant: string | undefined;
@@ -742,7 +752,7 @@ export function makeOpenCodeAdapter(
 
     /**
      * Resolve a model's context window (tokens) from the cache populated by
-     * {@link loadModelContextWindows}. Pure and synchronous so it is safe to
+     * {@link loadContextUsageMetadata}. Pure and synchronous so it is safe to
      * call from the event-pump fiber — no network round-trip can stall
      * streaming. Returns `null` when the model has no known limit.
      */
@@ -753,36 +763,49 @@ export function makeOpenCodeAdapter(
     ): number | null => context.modelContextWindowCache.get(`${providerID}/${modelID}`) ?? null;
 
     /**
-     * Populate the model context-window cache from the OpenCode
-     * `config.providers` endpoint — the same source the OpenCode web app uses
-     * for its context-usage indicator. The provider list is static config, so
-     * it is fetched once per session, eagerly at session start (before the
-     * event pump forks) rather than from inside the pump. A failed fetch is
-     * recorded as loaded-with-empty-cache so it is not retried; the meter then
-     * degrades to showing token counts without a percentage.
+     * Populate the context-usage metadata (model context windows + the
+     * auto-compaction flag) from the OpenCode config endpoints. Both reads are
+     * static config, fetched once per session, eagerly at session start
+     * (before the event pump forks) rather than from inside the pump. A failed
+     * fetch is recorded as loaded-with-empty-cache so it is not retried; the
+     * meter then degrades to showing token counts without a percentage, and the
+     * auto-compaction flag keeps its `true` default.
      */
-    const loadModelContextWindows = Effect.fn("loadModelContextWindows")(function* (
+    const loadContextUsageMetadata = Effect.fn("loadContextUsageMetadata")(function* (
       context: OpenCodeSessionContext,
     ) {
       if (context.modelContextWindowCacheLoaded) {
         return;
       }
       context.modelContextWindowCacheLoaded = true;
-      const providersExit = yield* runOpenCodeSdk("config.providers", () =>
-        context.client.config.providers(),
-      ).pipe(Effect.exit);
-      if (!Exit.isSuccess(providersExit)) {
-        return;
+      const [providersExit, configExit] = yield* Effect.all(
+        [
+          runOpenCodeSdk("config.providers", () => context.client.config.providers()).pipe(
+            Effect.exit,
+          ),
+          runOpenCodeSdk("config.get", () => context.client.config.get()).pipe(Effect.exit),
+        ],
+        { concurrency: "unbounded" },
+      );
+      if (Exit.isSuccess(providersExit)) {
+        for (const provider of providersExit.value.data?.providers ?? []) {
+          for (const [modelId, model] of Object.entries(provider.models ?? {})) {
+            const contextWindow = model.limit?.context;
+            context.modelContextWindowCache.set(
+              `${provider.id}/${modelId}`,
+              typeof contextWindow === "number" &&
+                Number.isFinite(contextWindow) &&
+                contextWindow > 0
+                ? contextWindow
+                : null,
+            );
+          }
+        }
       }
-      for (const provider of providersExit.value.data?.providers ?? []) {
-        for (const [modelId, model] of Object.entries(provider.models ?? {})) {
-          const contextWindow = model.limit?.context;
-          context.modelContextWindowCache.set(
-            `${provider.id}/${modelId}`,
-            typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0
-              ? contextWindow
-              : null,
-          );
+      if (Exit.isSuccess(configExit)) {
+        const auto = configExit.value.data?.compaction?.auto;
+        if (typeof auto === "boolean") {
+          context.compactsAutomatically = auto;
         }
       }
     });
@@ -804,6 +827,7 @@ export function makeOpenCodeAdapter(
       const usage = buildOpenCodeContextWindowUsage({
         tokens,
         modelContextWindow: resolveModelContextWindow(context, providerID, modelID),
+        compactsAutomatically: context.compactsAutomatically,
       });
       if (usage === undefined) {
         return;
@@ -1548,6 +1572,7 @@ export function makeOpenCodeAdapter(
           turns: [],
           modelContextWindowCache: new Map(),
           modelContextWindowCacheLoaded: false,
+          compactsAutomatically: true,
           activeTurnId: undefined,
           activeAgent: undefined,
           activeVariant: undefined,
@@ -1555,9 +1580,9 @@ export function makeOpenCodeAdapter(
           sessionScope: started.sessionScope,
         };
         sessions.set(input.threadId, context);
-        // Populate the model context-window cache before the event pump forks
-        // so token-usage emissions never block streaming on a network fetch.
-        yield* loadModelContextWindows(context).pipe(Effect.ignore);
+        // Populate the context-usage metadata before the event pump forks so
+        // token-usage emissions never block streaming on a network fetch.
+        yield* loadContextUsageMetadata(context).pipe(Effect.ignore);
         yield* startEventPump(context);
 
         yield* emit({

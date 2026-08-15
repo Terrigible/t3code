@@ -74,6 +74,8 @@ const runtimeMock = {
       providers: Array<{ id: string; models: Record<string, unknown> }>;
     },
     configProvidersError: null as Error | null,
+    configGet: null as null | Record<string, unknown>,
+    configGetError: null as Error | null,
     sessionGetIds: [] as string[],
     missingSessionIds: new Set<string>(),
     transientErrorSessionIds: new Set<string>(),
@@ -96,6 +98,8 @@ const runtimeMock = {
     this.state.subscribedEvents = [];
     this.state.configProviders = null;
     this.state.configProvidersError = null;
+    this.state.configGet = null;
+    this.state.configGetError = null;
     this.state.sessionGetIds.length = 0;
     this.state.missingSessionIds.clear();
     this.state.transientErrorSessionIds.clear();
@@ -231,6 +235,12 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
               default: {},
             },
           };
+        },
+        get: async () => {
+          if (runtimeMock.state.configGetError) {
+            throw runtimeMock.state.configGetError;
+          }
+          return { data: runtimeMock.state.configGet };
         },
       },
     }) as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
@@ -1244,6 +1254,13 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const withoutWindow = buildOpenCodeContextWindowUsage({ tokens });
       NodeAssert.equal("maxTokens" in withoutWindow!, false);
       NodeAssert.equal("totalProcessedTokens" in withoutWindow!, false);
+      NodeAssert.equal(withoutWindow!.compactsAutomatically, true);
+
+      const noAutoCompaction = buildOpenCodeContextWindowUsage({
+        tokens,
+        compactsAutomatically: false,
+      });
+      NodeAssert.equal(noAutoCompaction!.compactsAutomatically, false);
 
       const zeroTokens = buildOpenCodeContextWindowUsage({
         tokens: {
@@ -1320,6 +1337,102 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         NodeAssert.equal(usage.lastUsedTokens, 5550);
         NodeAssert.equal("totalProcessedTokens" in usage, false);
         NodeAssert.equal(usage.compactsAutomatically, true);
+      }
+    }),
+  );
+
+  it.effect("reads the auto-compaction setting from the OpenCode config", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-auto-compact");
+      runtimeMock.state.configGet = { compaction: { auto: false } };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-auto-compact",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: {
+                input: 1000,
+                output: 100,
+                reasoning: 10,
+                cache: { read: 200, write: 50 },
+              },
+            },
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const usageEvent = events.find((event) => event.type === "thread.token-usage.updated");
+      NodeAssert.ok(usageEvent);
+      if (usageEvent.type === "thread.token-usage.updated") {
+        NodeAssert.equal(usageEvent.payload.usage.compactsAutomatically, false);
+      }
+    }),
+  );
+
+  it.effect("defaults to auto-compacting when the config omits the setting", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-auto-compact-default");
+      runtimeMock.state.configGet = { agent: { general: {} } };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-auto-compact-default",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: {
+                input: 1000,
+                output: 100,
+                reasoning: 10,
+                cache: { read: 200, write: 50 },
+              },
+            },
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const usageEvent = events.find((event) => event.type === "thread.token-usage.updated");
+      NodeAssert.ok(usageEvent);
+      if (usageEvent.type === "thread.token-usage.updated") {
+        NodeAssert.equal(usageEvent.payload.usage.compactsAutomatically, true);
       }
     }),
   );
