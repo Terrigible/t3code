@@ -75,6 +75,7 @@ const runtimeMock = {
       providers: Array<{ id: string; models: Record<string, unknown> }>;
     },
     configProvidersError: null as Error | null,
+    configProvidersHang: false as boolean,
     configGet: null as null | Record<string, unknown>,
     configGetError: null as Error | null,
     configGetHang: false as boolean,
@@ -101,6 +102,7 @@ const runtimeMock = {
     this.state.subscribedEvents = [];
     this.state.configProviders = null;
     this.state.configProvidersError = null;
+    this.state.configProvidersHang = false;
     this.state.configGet = null;
     this.state.configGetError = null;
     this.state.configGetHang = false;
@@ -232,6 +234,9 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
       config: {
         providers: async ({ directory }: { directory?: string }) => {
           runtimeMock.state.configProbeDirectories.push(directory ?? "");
+          if (runtimeMock.state.configProvidersHang) {
+            return new Promise<never>(() => {});
+          }
           if (runtimeMock.state.configProvidersError) {
             throw runtimeMock.state.configProvidersError;
           }
@@ -1576,7 +1581,6 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       );
     }),
   );
-
   it.effect("reads the auto-compaction setting from the OpenCode config", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
@@ -1615,6 +1619,65 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         threadId,
         runtimeMode: "full-access",
       });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+
+      const usageEvent = events.find((event) => event.type === "thread.token-usage.updated");
+      NodeAssert.ok(usageEvent);
+      if (usageEvent.type === "thread.token-usage.updated") {
+        NodeAssert.equal(usageEvent.payload.usage.compactsAutomatically, false);
+      }
+    }),
+  );
+
+  it.effect("reads the auto-compaction setting when the model catalog probe times out", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-auto-compact-catalog-timeout");
+      runtimeMock.state.configGet = { compaction: { auto: false } };
+      // config.providers never resolves; its probe must time out
+      // independently without discarding the completed config.get result.
+      runtimeMock.state.configProvidersHang = true;
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-auto-compact-catalog-timeout",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: {
+                input: 1000,
+                output: 100,
+                reasoning: 10,
+                cache: { read: 200, write: 50 },
+              },
+            },
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      // Drive the clock past the probe timeout in small steps so the pump
+      // schedules the config.providers timer before it fires; the per-probe
+      // timeout keeps the completed config.get result usable.
+      for (let elapsed = 0; elapsed < 3_000; elapsed += 100) {
+        yield* advanceTestClock(100);
+      }
 
       const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
       const usageEvent = events.find((event) => event.type === "thread.token-usage.updated");

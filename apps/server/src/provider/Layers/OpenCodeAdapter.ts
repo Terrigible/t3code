@@ -836,8 +836,8 @@ export function makeOpenCodeAdapter(
      * `OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS`, and later events read the
      * cache. A failed or timed-out probe is marked loaded so it is not
      * retried — the meter then shows token counts without a percentage. Each
-     * probe times out independently so a slow `config.get` does not discard a
-     * completed `config.providers` catalog.
+     * probe is handled independently so a slow or failed `config.get` does
+     * not discard a completed `config.providers` catalog, and vice versa.
      */
     const loadContextUsageMetadata = Effect.fn("loadContextUsageMetadata")(function* (
       context: OpenCodeSessionContext,
@@ -861,22 +861,21 @@ export function makeOpenCodeAdapter(
         ],
         { concurrency: "unbounded" },
       );
-      if (Option.isNone(providersProbe)) {
-        return;
-      }
-      const providersExit = providersProbe.value;
-      if (Exit.isSuccess(providersExit)) {
-        for (const provider of providersExit.value.data?.providers ?? []) {
-          for (const [modelId, model] of Object.entries(provider.models ?? {})) {
-            const contextWindow = model.limit?.context;
-            context.modelContextWindowCache.set(
-              `${provider.id}/${modelId}`,
-              typeof contextWindow === "number" &&
-                Number.isFinite(contextWindow) &&
-                contextWindow > 0
-                ? contextWindow
-                : null,
-            );
+      if (Option.isSome(providersProbe)) {
+        const providersExit = providersProbe.value;
+        if (Exit.isSuccess(providersExit)) {
+          for (const provider of providersExit.value.data?.providers ?? []) {
+            for (const [modelId, model] of Object.entries(provider.models ?? {})) {
+              const contextWindow = model.limit?.context;
+              context.modelContextWindowCache.set(
+                `${provider.id}/${modelId}`,
+                typeof contextWindow === "number" &&
+                  Number.isFinite(contextWindow) &&
+                  contextWindow > 0
+                  ? contextWindow
+                  : null,
+              );
+            }
           }
         }
       }
