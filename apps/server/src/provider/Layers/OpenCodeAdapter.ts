@@ -832,10 +832,12 @@ export function makeOpenCodeAdapter(
      * OpenCode config endpoints, scoped to the session directory so an
      * externally-launched server reports the project's config rather than its
      * own cwd. Runs lazily on the first token-bearing message; the sequential
-     * pump waits once per session, bounded by
+     * pump waits once per session, each probe bounded by
      * `OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS`, and later events read the
-     * cache. A failed or timed-out fetch is marked loaded so it is not
-     * retried — the meter then shows token counts without a percentage.
+     * cache. A failed or timed-out probe is marked loaded so it is not
+     * retried — the meter then shows token counts without a percentage. Each
+     * probe times out independently so a slow `config.get` does not discard a
+     * completed `config.providers` catalog.
      */
     const loadContextUsageMetadata = Effect.fn("loadContextUsageMetadata")(function* (
       context: OpenCodeSessionContext,
@@ -844,21 +846,25 @@ export function makeOpenCodeAdapter(
         return;
       }
       context.modelContextWindowCacheLoaded = true;
-      const metadata = yield* Effect.all(
+      const [providersProbe, configProbe] = yield* Effect.all(
         [
           runOpenCodeSdk("config.providers", () =>
             context.client.config.providers({ directory: context.directory }),
-          ).pipe(Effect.exit),
+          )
+            .pipe(Effect.exit)
+            .pipe(Effect.timeoutOption(OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS)),
           runOpenCodeSdk("config.get", () =>
             context.client.config.get({ directory: context.directory }),
-          ).pipe(Effect.exit),
+          )
+            .pipe(Effect.exit)
+            .pipe(Effect.timeoutOption(OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS)),
         ],
         { concurrency: "unbounded" },
-      ).pipe(Effect.timeoutOption(OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS));
-      if (Option.isNone(metadata)) {
+      );
+      if (Option.isNone(providersProbe)) {
         return;
       }
-      const [providersExit, configExit] = metadata.value;
+      const providersExit = providersProbe.value;
       if (Exit.isSuccess(providersExit)) {
         for (const provider of providersExit.value.data?.providers ?? []) {
           for (const [modelId, model] of Object.entries(provider.models ?? {})) {
@@ -874,10 +880,13 @@ export function makeOpenCodeAdapter(
           }
         }
       }
-      if (Exit.isSuccess(configExit)) {
-        const auto = configExit.value.data?.compaction?.auto;
-        if (typeof auto === "boolean") {
-          context.compactsAutomatically = auto;
+      if (Option.isSome(configProbe)) {
+        const configExit = configProbe.value;
+        if (Exit.isSuccess(configExit)) {
+          const auto = configExit.value.data?.compaction?.auto;
+          if (typeof auto === "boolean") {
+            context.compactsAutomatically = auto;
+          }
         }
       }
     });

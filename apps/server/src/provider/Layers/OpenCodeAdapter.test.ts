@@ -77,6 +77,7 @@ const runtimeMock = {
     configProvidersError: null as Error | null,
     configGet: null as null | Record<string, unknown>,
     configGetError: null as Error | null,
+    configGetHang: false as boolean,
     configProbeDirectories: [] as string[],
     sessionGetIds: [] as string[],
     missingSessionIds: new Set<string>(),
@@ -102,6 +103,7 @@ const runtimeMock = {
     this.state.configProvidersError = null;
     this.state.configGet = null;
     this.state.configGetError = null;
+    this.state.configGetHang = false;
     this.state.configProbeDirectories.length = 0;
     this.state.sessionGetIds.length = 0;
     this.state.missingSessionIds.clear();
@@ -242,6 +244,9 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         },
         get: async ({ directory }: { directory?: string }) => {
           runtimeMock.state.configProbeDirectories.push(directory ?? "");
+          if (runtimeMock.state.configGetHang) {
+            return new Promise<never>(() => {});
+          }
           if (runtimeMock.state.configGetError) {
             throw runtimeMock.state.configGetError;
           }
@@ -1724,6 +1729,74 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       if (usageEvent.type === "thread.token-usage.updated") {
         NodeAssert.equal(usageEvent.payload.usage.usedTokens, 2600);
         NodeAssert.equal("maxTokens" in usageEvent.payload.usage, false);
+      }
+    }),
+  );
+
+  it.effect("keeps the model catalog when only the auto-compaction probe times out", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-token-usage-probe-timeout");
+      runtimeMock.state.configProviders = {
+        providers: [
+          {
+            id: "opencode",
+            models: {
+              "gpt-5.4": { limit: { context: 200_000, output: 16_384 } },
+            },
+          },
+        ],
+      };
+      // config.get never resolves; its probe must time out independently
+      // without discarding the completed config.providers catalog.
+      runtimeMock.state.configGetHang = true;
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-token-usage-probe-timeout",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: {
+                input: 1000,
+                output: 100,
+                reasoning: 10,
+                cache: { read: 200, write: 50 },
+              },
+            },
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      // Drive the clock past the probe timeout in small steps so the pump
+      // schedules the config.get timer before it fires; the per-probe
+      // timeout keeps the completed config.providers catalog usable.
+      for (let elapsed = 0; elapsed < 3_000; elapsed += 100) {
+        yield* advanceTestClock(100);
+      }
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const usageEvent = events.find((event) => event.type === "thread.token-usage.updated");
+      NodeAssert.ok(usageEvent);
+      if (usageEvent.type === "thread.token-usage.updated") {
+        NodeAssert.equal(usageEvent.payload.usage.usedTokens, 1360);
+        NodeAssert.equal(usageEvent.payload.usage.maxTokens, 200_000);
       }
     }),
   );
