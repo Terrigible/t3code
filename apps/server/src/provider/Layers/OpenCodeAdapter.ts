@@ -63,7 +63,7 @@ const PROVIDER = ProviderDriverKind.make("opencode");
  * session start (`Effect.ignore` handles rejection, not non-resolution,
  * so an untimed fetch can hang `startSession` forever).
  */
-const OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS = 10_000;
+const OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS = 2_000;
 
 /**
  * Version tag stamped into the OpenCode resume cursor. Bump if the cursor
