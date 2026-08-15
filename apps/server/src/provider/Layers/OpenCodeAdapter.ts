@@ -191,14 +191,10 @@ function trimText(value: string | undefined | null): string | undefined {
 }
 
 /**
- * Token breakdown shape OpenCode attaches to assistant messages
- * (`AssistantMessage.tokens`). All counts are cumulative over the current
- * context window, so the last assistant message's total approximates live
- * window usage — the same computation the OpenCode web app performs
- * (`tokenTotal(msg) / limit.context`). Every counter is optional because
- * this type also admits the degraded shape: a provider regression that
- * omits counters (or the whole `cache` block) must zero the meter, not
- * defect the event pump — a throw here would tear down the session.
+ * Token breakdown OpenCode attaches to assistant messages. Counts are
+ * cumulative over the session, so the last assistant message's total is the
+ * live window usage. Every field is optional: the type also admits degraded
+ * breakdowns (missing counters or a missing `cache` block) without throwing.
  */
 export interface OpenCodeAssistantTokenCounts {
   readonly input?: number;
@@ -208,27 +204,19 @@ export interface OpenCodeAssistantTokenCounts {
 }
 
 /**
- * Sanitize a single OpenCode token counter, mirroring the Claude adapter's
- * `finiteNonNegativeInteger`: anything that is not a finite non-negative
- * number (including a missing counter) becomes `0`. Provider usage echoes
- * have shipped negative and non-finite counts in the wild (OpenCode itself
- * regressed on this class of bug), and a `NaN` here would defeat the `<= 0`
- * guard, break the `===` dedup, and serialize to `null` in JSON — silently
- * stalling the meter.
+ * Sanitize one OpenCode token counter: anything that is not a finite
+ * non-negative number becomes `0`. A `NaN` would defeat the `<= 0` guard,
+ * break the `===` dedup, and serialize to `null` in JSON.
  */
 function openCodeTokenCounter(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : 0;
 }
 
 /**
- * Total tokens an OpenCode message counted. Mirrors the OpenCode web app's
- * `tokenTotal` — `input`, `output`, `reasoning`, `cache.read` and
- * `cache.write` are disjoint counters (OpenCode reports `reasoning` outside
- * `output`, unlike Codex/Claude where it is a subset), so they all sum.
- * Each counter is sanitized by {@link openCodeTokenCounter} first, so a
- * malformed or missing count degrades to zero instead of leaking into the
- * total or throwing. The whole breakdown may be missing (`null`/`undefined`
- * input) for the same reason.
+ * Sum of an OpenCode message's disjoint token counters, mirroring the OpenCode
+ * web app's `tokenTotal`. Unlike Codex/Claude, OpenCode reports `reasoning`
+ * outside `output`, so the counters all sum. A missing or malformed counter
+ * degrades to zero via {@link openCodeTokenCounter}.
  */
 export function openCodeTokenTotal(
   tokens: OpenCodeAssistantTokenCounts | null | undefined,
@@ -243,21 +231,15 @@ export function openCodeTokenTotal(
 }
 
 /**
- * Build a {@link ThreadTokenUsageSnapshot} from an OpenCode assistant
- * message's cumulative token counts and the model's context window. Returns
- * `undefined` when there is nothing to report (no tokens). `maxTokens` is
- * only set when a real, positive context limit is known. `usedTokens` is
- * clamped to `maxTokens` when known, mirroring the Claude adapter — OpenCode's
- * counts can momentarily exceed the limit (e.g. around auto-compaction), and
- * a meter reading past 100% reads as a lie. `compactsAutomatically` defaults
- * to `true` — OpenCode auto-compacts unless the config explicitly disables
- * it — and is surfaced so the meter can label the auto-compaction behavior
- * honestly. The `last*` fields (previous snapshot) are omitted: nothing
- * consumes them, and OpenCode's cumulative counts carry no previous-snapshot
- * to report anyway. Each counter is sanitized by
- * {@link openCodeTokenCounter}, so a malformed or missing count degrades to
- * zero and the snapshot still renders the valid portion — including when the
- * whole breakdown is missing, which yields no snapshot rather than a throw.
+ * Build a {@link ThreadTokenUsageSnapshot} from an assistant message's
+ * cumulative counts and the model's context window; `undefined` when there
+ * are no tokens. `usedTokens` is clamped to `maxTokens` — OpenCode counts can
+ * momentarily exceed the limit (e.g. around auto-compaction), and a meter
+ * past 100% reads as a lie. `compactsAutomatically` defaults to `true`
+ * (OpenCode auto-compacts unless the config disables it); `last*` fields are
+ * omitted because nothing consumes them and OpenCode reports no
+ * previous-snapshot. Malformed counters degrade to zero via
+ * {@link openCodeTokenCounter} instead of throwing.
  */
 export function buildOpenCodeContextWindowUsage(input: {
   readonly tokens: OpenCodeAssistantTokenCounts | null | undefined;
@@ -296,12 +278,10 @@ export function buildOpenCodeContextWindowUsage(input: {
 }
 
 /**
- * Whether a previous usage snapshot equals the next in every field that
- * determines what the meter displays. OpenCode re-broadcasts completed
- * messages (finish-state updates, resume replays), and emitting an unchanged
- * snapshot again would persist a duplicate `context-window.updated` activity
- * per broadcast. `undefined` never matches, so the first emission of a
- * session always goes through. Exported for unit testing.
+ * Whether two snapshots display identically. OpenCode re-broadcasts completed
+ * messages (finish-state updates, resume replays); skipping the equal case
+ * avoids persisting a duplicate `context-window.updated` activity per
+ * broadcast.
  */
 export function isSameOpenCodeContextWindowUsage(
   previous: ThreadTokenUsageSnapshot | undefined,
@@ -358,28 +338,20 @@ interface OpenCodeSessionContext {
   readonly completedAssistantPartIds: Set<string>;
   readonly turns: Array<OpenCodeTurnSnapshot>;
   /**
-   * `providerID/modelID` → model context window (tokens), populated once per
-   * session from the OpenCode `config.providers` endpoint by
-   * {@link loadContextUsageMetadata}. `null` means the model has no known
-   * limit (e.g. user-defined models without metadata). Once
-   * {@link OpenCodeSessionContext.modelContextWindowCacheLoaded} is set, the
-   * cache is considered final — a failed fetch is not retried.
+   * `providerID/modelID` → model context window (tokens). `null` means the
+   * model has no known limit. Final once `modelContextWindowCacheLoaded` is
+   * set — a failed fetch is not retried.
    */
   readonly modelContextWindowCache: Map<string, number | null>;
   modelContextWindowCacheLoaded: boolean;
   /**
-   * Whether the OpenCode session auto-compacts its context. Read from the
-   * config `compaction.auto` setting by {@link loadContextUsageMetadata} and
-   * defaults to `true` — OpenCode auto-compacts unless the config explicitly
-   * sets `compaction.auto: false`.
+   * Whether the session auto-compacts its context, from the config
+   * `compaction.auto` setting.
    */
   compactsAutomatically: boolean;
   /**
-   * The most recently emitted usage snapshot for this session. Dedup guard
-   * for re-broadcast `message.updated` events: OpenCode can re-emit a
-   * completed message with unchanged cumulative counts, and emitting the
-   * identical snapshot again would persist a duplicate
-   * `context-window.updated` activity per broadcast.
+   * Last emitted usage snapshot; dedup guard for re-broadcast
+   * `message.updated` events with unchanged cumulative counts.
    */
   lastEmittedContextWindowUsage: ThreadTokenUsageSnapshot | undefined;
   activeTurnId: TurnId | undefined;
@@ -831,12 +803,7 @@ export function makeOpenCodeAdapter(
       },
     ) => writeNativeEvent(threadId, event).pipe(Effect.catchCause(() => Effect.void));
 
-    /**
-     * Resolve a model's context window (tokens) from the cache populated by
-     * {@link loadContextUsageMetadata}. Pure and synchronous so it is safe to
-     * call from the event-pump fiber — no network round-trip can stall
-     * streaming. Returns `null` when the model has no known limit.
-     */
+    /** Context window for `providerID/modelID`, or `null` when unknown. */
     const resolveModelContextWindow = (
       context: OpenCodeSessionContext,
       providerID: string,
@@ -844,19 +811,14 @@ export function makeOpenCodeAdapter(
     ): number | null => context.modelContextWindowCache.get(`${providerID}/${modelID}`) ?? null;
 
     /**
-     * Populate the context-usage metadata (model context windows + the
-     * auto-compaction flag) from the OpenCode config endpoints, scoped to the
-     * session's directory so an externally-launched server reports the
-     * project's config rather than its own cwd. Both reads are static config,
-     * fetched on demand — lazily on the first token-bearing message rather
-     * than at session start, mirroring how the Claude adapter queries context
-     * usage during result processing. The pump is sequential, so that first
-     * emission waits once per session, bounded by
-     * `OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS`; later events read the
-     * cache. A failed or timed-out fetch is recorded as loaded-with-empty-cache
-     * so it is not retried; the meter then degrades to showing token counts
-     * without a percentage, and the auto-compaction flag keeps its `true`
-     * default.
+     * Populate model context windows and the auto-compaction flag from the
+     * OpenCode config endpoints, scoped to the session directory so an
+     * externally-launched server reports the project's config rather than its
+     * own cwd. Runs lazily on the first token-bearing message; the sequential
+     * pump waits once per session, bounded by
+     * `OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS`, and later events read the
+     * cache. A failed or timed-out fetch is marked loaded so it is not
+     * retried — the meter then shows token counts without a percentage.
      */
     const loadContextUsageMetadata = Effect.fn("loadContextUsageMetadata")(function* (
       context: OpenCodeSessionContext,
@@ -904,15 +866,10 @@ export function makeOpenCodeAdapter(
     });
 
     /**
-     * Emit a `thread.token-usage.updated` event from an OpenCode assistant
-     * message's cumulative token counts. No-op when the message carries no
-     * tokens (`usedTokens <= 0`), matching the ingestion filter that turns
-     * these events into `context-window.updated` activities, or when the
-     * snapshot equals the last one emitted (OpenCode can re-broadcast a
-     * completed message; re-emitting would persist a duplicate activity).
-     * Ensures the context-usage metadata is loaded before building the
-     * snapshot so the first emission of a session already carries the model
-     * context window when one is known.
+     * Emit a `thread.token-usage.updated` event from an assistant message's
+     * cumulative token counts. No-op when there are no tokens or the snapshot
+     * is unchanged (OpenCode can re-broadcast a completed message; re-emitting
+     * would persist a duplicate activity).
      */
     const emitContextWindowUsage = Effect.fn("emitContextWindowUsage")(function* (
       context: OpenCodeSessionContext,
