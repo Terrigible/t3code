@@ -205,13 +205,33 @@ export interface OpenCodeAssistantTokenCounts {
 }
 
 /**
+ * Sanitize a single OpenCode token counter, mirroring the Claude adapter's
+ * `finiteNonNegativeInteger`: anything that is not a finite non-negative
+ * number becomes `0`. Provider usage echoes have shipped negative and
+ * non-finite counts in the wild (OpenCode itself regressed on this class of
+ * bug), and a `NaN` here would defeat the `<= 0` guard, break the `===`
+ * dedup, and serialize to `null` in JSON — silently stalling the meter.
+ */
+function openCodeTokenCounter(value: number): number {
+  return Number.isFinite(value) && value >= 0 ? Math.round(value) : 0;
+}
+
+/**
  * Total tokens an OpenCode message counted. Mirrors the OpenCode web app's
  * `tokenTotal` — `input`, `output`, `reasoning`, `cache.read` and
  * `cache.write` are disjoint counters (OpenCode reports `reasoning` outside
  * `output`, unlike Codex/Claude where it is a subset), so they all sum.
+ * Each counter is sanitized by {@link openCodeTokenCounter} first, so a
+ * malformed count degrades to zero instead of leaking into the total.
  */
 export function openCodeTokenTotal(tokens: OpenCodeAssistantTokenCounts): number {
-  return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write;
+  return (
+    openCodeTokenCounter(tokens.input) +
+    openCodeTokenCounter(tokens.output) +
+    openCodeTokenCounter(tokens.reasoning) +
+    openCodeTokenCounter(tokens.cache.read) +
+    openCodeTokenCounter(tokens.cache.write)
+  );
 }
 
 /**
@@ -224,14 +244,24 @@ export function openCodeTokenTotal(tokens: OpenCodeAssistantTokenCounts): number
  * a meter reading past 100% reads as a lie. `compactsAutomatically` defaults
  * to `true` — OpenCode auto-compacts unless the config explicitly disables
  * it — and is surfaced so the meter can label the auto-compaction behavior
- * honestly.
+ * honestly. The `last*` fields (previous snapshot) are omitted: nothing
+ * consumes them, and OpenCode's cumulative counts carry no previous-snapshot
+ * to report anyway. Each counter is sanitized by
+ * {@link openCodeTokenCounter}, so a malformed count degrades to zero and
+ * the snapshot still renders the valid portion.
  */
 export function buildOpenCodeContextWindowUsage(input: {
   readonly tokens: OpenCodeAssistantTokenCounts;
   readonly modelContextWindow?: number | null | undefined;
   readonly compactsAutomatically?: boolean | undefined;
 }): ThreadTokenUsageSnapshot | undefined {
-  const rawUsedTokens = openCodeTokenTotal(input.tokens);
+  const inputTokens = openCodeTokenCounter(input.tokens.input);
+  const outputTokens = openCodeTokenCounter(input.tokens.output);
+  const reasoningTokens = openCodeTokenCounter(input.tokens.reasoning);
+  const cachedReadTokens = openCodeTokenCounter(input.tokens.cache.read);
+  const cachedWriteTokens = openCodeTokenCounter(input.tokens.cache.write);
+  const rawUsedTokens =
+    inputTokens + outputTokens + reasoningTokens + cachedReadTokens + cachedWriteTokens;
   if (rawUsedTokens <= 0) {
     return undefined;
   }
@@ -248,15 +278,10 @@ export function buildOpenCodeContextWindowUsage(input: {
   return {
     usedTokens,
     ...(modelContextWindow !== undefined ? { maxTokens: modelContextWindow } : {}),
-    inputTokens: input.tokens.input,
-    cachedInputTokens: input.tokens.cache.read,
-    outputTokens: input.tokens.output,
-    reasoningOutputTokens: input.tokens.reasoning,
-    lastUsedTokens: usedTokens,
-    lastInputTokens: input.tokens.input,
-    lastCachedInputTokens: input.tokens.cache.read,
-    lastOutputTokens: input.tokens.output,
-    lastReasoningOutputTokens: input.tokens.reasoning,
+    inputTokens,
+    cachedInputTokens: cachedReadTokens,
+    outputTokens,
+    reasoningOutputTokens: reasoningTokens,
     compactsAutomatically: input.compactsAutomatically ?? true,
   };
 }

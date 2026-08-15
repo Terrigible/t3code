@@ -1244,13 +1244,9 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         cachedInputTokens: 1000,
         outputTokens: 200,
         reasoningOutputTokens: 50,
-        lastUsedTokens: 5550,
-        lastInputTokens: 4000,
-        lastCachedInputTokens: 1000,
-        lastOutputTokens: 200,
-        lastReasoningOutputTokens: 50,
         compactsAutomatically: true,
       });
+      NodeAssert.equal("lastUsedTokens" in withWindow!, false);
 
       const withoutWindow = buildOpenCodeContextWindowUsage({ tokens });
       NodeAssert.equal("maxTokens" in withoutWindow!, false);
@@ -1284,9 +1280,47 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         modelContextWindow: 200_000,
       });
       NodeAssert.equal(overWindow!.usedTokens, 200000);
-      NodeAssert.equal(overWindow!.lastUsedTokens, 200000);
       NodeAssert.equal(overWindow!.maxTokens, 200000);
       NodeAssert.equal(overWindow!.inputTokens, 250000);
+    }),
+  );
+
+  it.effect("sanitizes malformed token counters instead of leaking them", () =>
+    Effect.sync(() => {
+      NodeAssert.equal(
+        openCodeTokenTotal({
+          input: NaN,
+          output: 100,
+          reasoning: -5,
+          cache: { read: Infinity, write: 0 },
+        }),
+        100,
+      );
+
+      const malformed = buildOpenCodeContextWindowUsage({
+        tokens: {
+          input: NaN,
+          output: 100,
+          reasoning: -5,
+          cache: { read: 0, write: 0 },
+        },
+        modelContextWindow: 200_000,
+      });
+      NodeAssert.equal(malformed!.usedTokens, 100);
+      NodeAssert.equal(malformed!.maxTokens, 200000);
+      NodeAssert.equal(malformed!.inputTokens, 0);
+      NodeAssert.equal(malformed!.outputTokens, 100);
+      NodeAssert.equal(malformed!.reasoningOutputTokens, 0);
+
+      const allMalformed = buildOpenCodeContextWindowUsage({
+        tokens: {
+          input: NaN,
+          output: -1,
+          reasoning: Infinity,
+          cache: { read: NaN, write: 0 },
+        },
+      });
+      NodeAssert.equal(allMalformed, undefined);
     }),
   );
 
@@ -1373,7 +1407,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         NodeAssert.equal(usage.cachedInputTokens, 1000);
         NodeAssert.equal(usage.outputTokens, 200);
         NodeAssert.equal(usage.reasoningOutputTokens, 50);
-        NodeAssert.equal(usage.lastUsedTokens, 5550);
+        NodeAssert.equal("lastUsedTokens" in usage, false);
         NodeAssert.equal("totalProcessedTokens" in usage, false);
         NodeAssert.equal(usage.compactsAutomatically, true);
       }
