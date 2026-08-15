@@ -35,6 +35,7 @@ import {
   appendOpenCodeAssistantTextDelta,
   buildOpenCodeContextWindowUsage,
   isOpenCodeNotFound,
+  isSameOpenCodeContextWindowUsage,
   isSameOpenCodeDirectory,
   makeOpenCodeAdapter,
   mergeOpenCodeAssistantText,
@@ -1272,6 +1273,44 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         modelContextWindow: 200_000,
       });
       NodeAssert.equal(zeroTokens, undefined);
+
+      const overWindow = buildOpenCodeContextWindowUsage({
+        tokens: {
+          input: 250_000,
+          output: 1000,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+        modelContextWindow: 200_000,
+      });
+      NodeAssert.equal(overWindow!.usedTokens, 200000);
+      NodeAssert.equal(overWindow!.lastUsedTokens, 200000);
+      NodeAssert.equal(overWindow!.maxTokens, 200000);
+      NodeAssert.equal(overWindow!.inputTokens, 250000);
+    }),
+  );
+
+  it.effect("treats only byte-identical usage snapshots as duplicates", () =>
+    Effect.sync(() => {
+      const tokens = {
+        input: 4000,
+        output: 200,
+        reasoning: 50,
+        cache: { read: 1000, write: 300 },
+      };
+      const first = buildOpenCodeContextWindowUsage({ tokens, modelContextWindow: 200_000 })!;
+      const same = buildOpenCodeContextWindowUsage({ tokens, modelContextWindow: 200_000 })!;
+      const grown = buildOpenCodeContextWindowUsage({
+        tokens: { ...tokens, input: 5000 },
+        modelContextWindow: 200_000,
+      })!;
+      const windowless = buildOpenCodeContextWindowUsage({ tokens })!;
+      NodeAssert.equal(isSameOpenCodeContextWindowUsage(first, same), true);
+      NodeAssert.equal(isSameOpenCodeContextWindowUsage(first, grown), false);
+      NodeAssert.equal(isSameOpenCodeContextWindowUsage(first, windowless), false);
+      NodeAssert.equal(isSameOpenCodeContextWindowUsage(undefined, first), false);
+      NodeAssert.equal(isSameOpenCodeContextWindowUsage(first, undefined), false);
+      NodeAssert.equal(isSameOpenCodeContextWindowUsage(undefined, undefined), false);
     }),
   );
 
@@ -1493,6 +1532,95 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       if (usageEvent.type === "thread.token-usage.updated") {
         NodeAssert.equal(usageEvent.payload.usage.usedTokens, 2600);
         NodeAssert.equal("maxTokens" in usageEvent.payload.usage, false);
+      }
+    }),
+  );
+
+  it.effect("dedupes re-broadcast token counts and re-emits when they grow", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-token-usage-dedup");
+      runtimeMock.state.configProviders = {
+        providers: [
+          {
+            id: "opencode",
+            models: {
+              "gpt-5.4": { limit: { context: 200_000, output: 16_384 } },
+            },
+          },
+        ],
+      };
+      const messageTokens = {
+        input: 1000,
+        output: 100,
+        reasoning: 10,
+        cache: { read: 200, write: 50 },
+      };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-dedup-a",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: messageTokens,
+            },
+          },
+        },
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-dedup-a-again",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: messageTokens,
+            },
+          },
+        },
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-dedup-b",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: { ...messageTokens, input: 2000 },
+            },
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(4),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      // Without dedup the collected events would be
+      // `[session.started, thread.started, usage(1360), usage(1360)]` and the
+      // second usage event would carry the stale totals; with dedup the
+      // re-broadcast is skipped and the fourth event is the grown snapshot.
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const usageEvents = events.filter((event) => event.type === "thread.token-usage.updated");
+      NodeAssert.equal(usageEvents.length, 2);
+      const lastUsageEvent = usageEvents[1];
+      if (lastUsageEvent?.type === "thread.token-usage.updated") {
+        NodeAssert.equal(lastUsageEvent.payload.usage.usedTokens, 2360);
       }
     }),
   );
