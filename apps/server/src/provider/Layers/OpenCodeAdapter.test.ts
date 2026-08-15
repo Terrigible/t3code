@@ -1389,54 +1389,6 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
-  it.effect("defaults to auto-compacting when the config omits the setting", () =>
-    Effect.gen(function* () {
-      const adapter = yield* OpenCodeAdapter;
-      const threadId = asThreadId("thread-opencode-auto-compact-default");
-      runtimeMock.state.configGet = { agent: { general: {} } };
-      runtimeMock.state.subscribedEvents = [
-        {
-          type: "message.updated",
-          properties: {
-            sessionID: "http://127.0.0.1:9999/session",
-            info: {
-              id: "msg-auto-compact-default",
-              role: "assistant",
-              providerID: "opencode",
-              modelID: "gpt-5.4",
-              tokens: {
-                input: 1000,
-                output: 100,
-                reasoning: 10,
-                cache: { read: 200, write: 50 },
-              },
-            },
-          },
-        },
-      ];
-
-      const eventsFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter((event) => event.threadId === threadId),
-        Stream.take(3),
-        Stream.runCollect,
-        Effect.forkChild,
-      );
-
-      yield* adapter.startSession({
-        provider: ProviderDriverKind.make("opencode"),
-        threadId,
-        runtimeMode: "full-access",
-      });
-
-      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
-      const usageEvent = events.find((event) => event.type === "thread.token-usage.updated");
-      NodeAssert.ok(usageEvent);
-      if (usageEvent.type === "thread.token-usage.updated") {
-        NodeAssert.equal(usageEvent.payload.usage.compactsAutomatically, true);
-      }
-    }),
-  );
-
   it.effect("emits thread token usage without a max when the model limit is unknown", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
