@@ -195,24 +195,28 @@ function trimText(value: string | undefined | null): string | undefined {
  * (`AssistantMessage.tokens`). All counts are cumulative over the current
  * context window, so the last assistant message's total approximates live
  * window usage — the same computation the OpenCode web app performs
- * (`tokenTotal(msg) / limit.context`).
+ * (`tokenTotal(msg) / limit.context`). Every counter is optional because
+ * this type also admits the degraded shape: a provider regression that
+ * omits counters (or the whole `cache` block) must zero the meter, not
+ * defect the event pump — a throw here would tear down the session.
  */
 export interface OpenCodeAssistantTokenCounts {
-  readonly input: number;
-  readonly output: number;
-  readonly reasoning: number;
-  readonly cache: { readonly read: number; readonly write: number };
+  readonly input?: number;
+  readonly output?: number;
+  readonly reasoning?: number;
+  readonly cache?: { readonly read?: number; readonly write?: number };
 }
 
 /**
  * Sanitize a single OpenCode token counter, mirroring the Claude adapter's
  * `finiteNonNegativeInteger`: anything that is not a finite non-negative
- * number becomes `0`. Provider usage echoes have shipped negative and
- * non-finite counts in the wild (OpenCode itself regressed on this class of
- * bug), and a `NaN` here would defeat the `<= 0` guard, break the `===`
- * dedup, and serialize to `null` in JSON — silently stalling the meter.
+ * number (including a missing counter) becomes `0`. Provider usage echoes
+ * have shipped negative and non-finite counts in the wild (OpenCode itself
+ * regressed on this class of bug), and a `NaN` here would defeat the `<= 0`
+ * guard, break the `===` dedup, and serialize to `null` in JSON — silently
+ * stalling the meter.
  */
-function openCodeTokenCounter(value: number): number {
+function openCodeTokenCounter(value: unknown): number {
   return Number.isFinite(value) && value >= 0 ? Math.round(value) : 0;
 }
 
@@ -222,15 +226,19 @@ function openCodeTokenCounter(value: number): number {
  * `cache.write` are disjoint counters (OpenCode reports `reasoning` outside
  * `output`, unlike Codex/Claude where it is a subset), so they all sum.
  * Each counter is sanitized by {@link openCodeTokenCounter} first, so a
- * malformed count degrades to zero instead of leaking into the total.
+ * malformed or missing count degrades to zero instead of leaking into the
+ * total or throwing. The whole breakdown may be missing (`null`/`undefined`
+ * input) for the same reason.
  */
-export function openCodeTokenTotal(tokens: OpenCodeAssistantTokenCounts): number {
+export function openCodeTokenTotal(
+  tokens: OpenCodeAssistantTokenCounts | null | undefined,
+): number {
   return (
-    openCodeTokenCounter(tokens.input) +
-    openCodeTokenCounter(tokens.output) +
-    openCodeTokenCounter(tokens.reasoning) +
-    openCodeTokenCounter(tokens.cache.read) +
-    openCodeTokenCounter(tokens.cache.write)
+    openCodeTokenCounter(tokens?.input) +
+    openCodeTokenCounter(tokens?.output) +
+    openCodeTokenCounter(tokens?.reasoning) +
+    openCodeTokenCounter(tokens?.cache?.read) +
+    openCodeTokenCounter(tokens?.cache?.write)
   );
 }
 
@@ -247,19 +255,20 @@ export function openCodeTokenTotal(tokens: OpenCodeAssistantTokenCounts): number
  * honestly. The `last*` fields (previous snapshot) are omitted: nothing
  * consumes them, and OpenCode's cumulative counts carry no previous-snapshot
  * to report anyway. Each counter is sanitized by
- * {@link openCodeTokenCounter}, so a malformed count degrades to zero and
- * the snapshot still renders the valid portion.
+ * {@link openCodeTokenCounter}, so a malformed or missing count degrades to
+ * zero and the snapshot still renders the valid portion — including when the
+ * whole breakdown is missing, which yields no snapshot rather than a throw.
  */
 export function buildOpenCodeContextWindowUsage(input: {
-  readonly tokens: OpenCodeAssistantTokenCounts;
+  readonly tokens: OpenCodeAssistantTokenCounts | null | undefined;
   readonly modelContextWindow?: number | null | undefined;
   readonly compactsAutomatically?: boolean | undefined;
 }): ThreadTokenUsageSnapshot | undefined {
-  const inputTokens = openCodeTokenCounter(input.tokens.input);
-  const outputTokens = openCodeTokenCounter(input.tokens.output);
-  const reasoningTokens = openCodeTokenCounter(input.tokens.reasoning);
-  const cachedReadTokens = openCodeTokenCounter(input.tokens.cache.read);
-  const cachedWriteTokens = openCodeTokenCounter(input.tokens.cache.write);
+  const inputTokens = openCodeTokenCounter(input.tokens?.input);
+  const outputTokens = openCodeTokenCounter(input.tokens?.output);
+  const reasoningTokens = openCodeTokenCounter(input.tokens?.reasoning);
+  const cachedReadTokens = openCodeTokenCounter(input.tokens?.cache?.read);
+  const cachedWriteTokens = openCodeTokenCounter(input.tokens?.cache?.write);
   const rawUsedTokens =
     inputTokens + outputTokens + reasoningTokens + cachedReadTokens + cachedWriteTokens;
   if (rawUsedTokens <= 0) {
