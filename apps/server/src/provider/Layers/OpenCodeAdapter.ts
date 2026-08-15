@@ -217,7 +217,7 @@ export interface OpenCodeAssistantTokenCounts {
  * stalling the meter.
  */
 function openCodeTokenCounter(value: unknown): number {
-  return Number.isFinite(value) && value >= 0 ? Math.round(value) : 0;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : 0;
 }
 
 /**
