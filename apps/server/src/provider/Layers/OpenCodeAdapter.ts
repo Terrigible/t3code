@@ -246,6 +246,7 @@ export function buildOpenCodeContextWindowUsage(input: {
 
   const modelContextWindow =
     typeof input.modelContextWindow === "number" &&
+    Number.isInteger(input.modelContextWindow) &&
     Number.isFinite(input.modelContextWindow) &&
     input.modelContextWindow > 0
       ? input.modelContextWindow
@@ -1118,6 +1119,7 @@ export function makeOpenCodeAdapter(
               context.modelContextWindowCache.set(
                 `${provider.id}/${modelId}`,
                 typeof contextWindow === "number" &&
+                  Number.isInteger(contextWindow) &&
                   Number.isFinite(contextWindow) &&
                   contextWindow > 0
                   ? contextWindow
@@ -2159,6 +2161,24 @@ export function makeOpenCodeAdapter(
           event.type === "message.part.updated" ||
           (event.type === "message.updated" && event.properties.info.role === "assistant"));
       if (suppressInterruptedParentOutput) {
+        // Token usage is not display output — keep the meter accurate even
+        // for interrupted turns. Without this, an aborted assistant message
+        // that already carried the latest cumulative counts would be dropped
+        // and the meter would underreport until the next completed message.
+        if (
+          event.type === "message.updated" &&
+          event.properties.info.role === "assistant" &&
+          event.properties.info.tokens !== undefined
+        ) {
+          yield* emitContextWindowUsage(
+            context,
+            event.properties.info.tokens,
+            event.properties.info.providerID,
+            event.properties.info.modelID,
+            turnId,
+            event,
+          );
+        }
         return;
       }
 
