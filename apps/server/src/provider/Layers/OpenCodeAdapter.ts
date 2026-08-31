@@ -2165,19 +2165,41 @@ export function makeOpenCodeAdapter(
         // for interrupted turns. Without this, an aborted assistant message
         // that already carried the latest cumulative counts would be dropped
         // and the meter would underreport until the next completed message.
+        // Use the interrupted turn's id, not the current `activeTurnId`:
+        // after an interrupt `activeTurnId` is empty (turnless) and once a
+        // follow-up prompt sets `awaitingBusyAfterInterruption` it is already
+        // the *next* turn, so stamping with `turnId` would misattribute the
+        // aborted counts or break revert.
         if (
           event.type === "message.updated" &&
           event.properties.info.role === "assistant" &&
           event.properties.info.tokens !== undefined
         ) {
-          yield* emitContextWindowUsage(
-            context,
-            event.properties.info.tokens,
-            event.properties.info.providerID,
-            event.properties.info.modelID,
-            turnId,
-            event,
-          );
+          const usageTurnId =
+            context.interruptedTurnId ??
+            context.pendingIdleReconciliation?.turnId ??
+            (context.awaitingBusyAfterInterruption ? undefined : turnId);
+          if (usageTurnId !== undefined) {
+            yield* emitContextWindowUsage(
+              context,
+              event.properties.info.tokens,
+              event.properties.info.providerID,
+              event.properties.info.modelID,
+              usageTurnId,
+              event,
+            );
+          } else if (!context.awaitingBusyAfterInterruption) {
+            // No interrupted id known and not on the next turn — emit
+            // turnless as a last resort rather than dropping the meter.
+            yield* emitContextWindowUsage(
+              context,
+              event.properties.info.tokens,
+              event.properties.info.providerID,
+              event.properties.info.modelID,
+              turnId,
+              event,
+            );
+          }
         }
         return;
       }
