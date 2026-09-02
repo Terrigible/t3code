@@ -60,13 +60,8 @@ import * as Option from "effect/Option";
 
 const PROVIDER = ProviderDriverKind.make("opencode");
 
-/**
- * Bounded wait for the session-start context-usage metadata probes
- * (`config.providers` + `config.get`). These are best-effort — the meter
- * degrades gracefully without them — so a wedged fetch must not hold up
- * session start (`Effect.ignore` handles rejection, not non-resolution,
- * so an untimed fetch can hang `startSession` forever).
- */
+// Best-effort timeout for context-usage metadata probes. A wedged fetch
+// must not hang session start.
 const OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS = 2_000;
 
 /**
@@ -177,12 +172,7 @@ export function isSameOpenCodeDirectory(
   );
 }
 
-/**
- * Token breakdown OpenCode attaches to assistant messages. Counts are
- * cumulative over the session, so the last assistant message's total is the
- * live window usage. Every field is optional: the type also admits degraded
- * breakdowns (missing counters or a missing `cache` block) without throwing.
- */
+// OpenCode reports cumulative token counts per assistant message.
 export interface OpenCodeAssistantTokenCounts {
   readonly input?: number;
   readonly output?: number;
@@ -190,73 +180,50 @@ export interface OpenCodeAssistantTokenCounts {
   readonly cache?: { readonly read?: number; readonly write?: number };
 }
 
-/**
- * Sanitize one OpenCode token counter: anything that is not a finite
- * non-negative number becomes `0`. A `NaN` would defeat the `<= 0` guard,
- * break the `===` dedup, and serialize to `null` in JSON.
- */
-function openCodeTokenCounter(value: unknown): number {
+function sanitizeCounter(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : 0;
 }
 
-/**
- * Sum of an OpenCode message's disjoint token counters, mirroring the OpenCode
- * web app's `tokenTotal`. Unlike Codex/Claude, OpenCode reports `reasoning`
- * outside `output`, so the counters all sum. A missing or malformed counter
- * degrades to zero via {@link openCodeTokenCounter}.
- */
 export function openCodeTokenTotal(
   tokens: OpenCodeAssistantTokenCounts | null | undefined,
 ): number {
   return (
-    openCodeTokenCounter(tokens?.input) +
-    openCodeTokenCounter(tokens?.output) +
-    openCodeTokenCounter(tokens?.reasoning) +
-    openCodeTokenCounter(tokens?.cache?.read) +
-    openCodeTokenCounter(tokens?.cache?.write)
+    sanitizeCounter(tokens?.input) +
+    sanitizeCounter(tokens?.output) +
+    sanitizeCounter(tokens?.reasoning) +
+    sanitizeCounter(tokens?.cache?.read) +
+    sanitizeCounter(tokens?.cache?.write)
   );
 }
 
-/**
- * Build a {@link ThreadTokenUsageSnapshot} from an assistant message's
- * cumulative counts and the model's context window; `undefined` when there
- * are no tokens. `usedTokens` is clamped to `maxTokens` — OpenCode counts can
- * momentarily exceed the limit (e.g. around auto-compaction), and a meter
- * past 100% reads as a lie. `compactsAutomatically` defaults to `true`
- * (OpenCode auto-compacts unless the config disables it); `last*` fields are
- * omitted because nothing consumes them and OpenCode reports no
- * previous-snapshot. Malformed counters degrade to zero via
- * {@link openCodeTokenCounter} instead of throwing.
- */
+// Build a usage snapshot from cumulative counts. Returns undefined when no
+// tokens. Clamps usedTokens to maxTokens so the meter never exceeds 100%.
 export function buildOpenCodeContextWindowUsage(input: {
   readonly tokens: OpenCodeAssistantTokenCounts | null | undefined;
   readonly modelContextWindow?: number | null | undefined;
   readonly compactsAutomatically?: boolean | undefined;
 }): ThreadTokenUsageSnapshot | undefined {
-  const inputTokens = openCodeTokenCounter(input.tokens?.input);
-  const outputTokens = openCodeTokenCounter(input.tokens?.output);
-  const reasoningTokens = openCodeTokenCounter(input.tokens?.reasoning);
-  const cachedReadTokens = openCodeTokenCounter(input.tokens?.cache?.read);
-  const cachedWriteTokens = openCodeTokenCounter(input.tokens?.cache?.write);
+  const inputTokens = sanitizeCounter(input.tokens?.input);
+  const outputTokens = sanitizeCounter(input.tokens?.output);
+  const reasoningTokens = sanitizeCounter(input.tokens?.reasoning);
+  const cachedReadTokens = sanitizeCounter(input.tokens?.cache?.read);
+  const cachedWriteTokens = sanitizeCounter(input.tokens?.cache?.write);
   const rawUsedTokens =
     inputTokens + outputTokens + reasoningTokens + cachedReadTokens + cachedWriteTokens;
-  if (rawUsedTokens <= 0) {
-    return undefined;
-  }
+  if (rawUsedTokens <= 0) return undefined;
 
-  const modelContextWindow =
+  const maxTokens =
     typeof input.modelContextWindow === "number" &&
     Number.isInteger(input.modelContextWindow) &&
     Number.isFinite(input.modelContextWindow) &&
     input.modelContextWindow > 0
       ? input.modelContextWindow
       : undefined;
-  const usedTokens =
-    modelContextWindow !== undefined ? Math.min(rawUsedTokens, modelContextWindow) : rawUsedTokens;
+  const usedTokens = maxTokens !== undefined ? Math.min(rawUsedTokens, maxTokens) : rawUsedTokens;
 
   return {
     usedTokens,
-    ...(modelContextWindow !== undefined ? { maxTokens: modelContextWindow } : {}),
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
     inputTokens,
     cachedInputTokens: cachedReadTokens,
     outputTokens,
@@ -265,12 +232,7 @@ export function buildOpenCodeContextWindowUsage(input: {
   };
 }
 
-/**
- * Whether two snapshots display identically. OpenCode re-broadcasts completed
- * messages (finish-state updates, resume replays); skipping the equal case
- * avoids persisting a duplicate `context-window.updated` activity per
- * broadcast.
- */
+// Dedupe re-broadcast assistant messages with identical counts.
 export function isSameOpenCodeContextWindowUsage(
   previous: ThreadTokenUsageSnapshot | undefined,
   next: ThreadTokenUsageSnapshot | undefined,
@@ -456,22 +418,9 @@ interface OpenCodeSessionContext {
   readonly emittedTextByPartId: Map<string, string>;
   readonly completedAssistantPartIds: Set<string>;
   readonly turns: Array<OpenCodeTurnSnapshot>;
-  /**
-   * `providerID/modelID` → model context window (tokens). `null` means the
-   * model has no known limit. Final once `modelContextWindowCacheLoaded` is
-   * set — a failed fetch is not retried.
-   */
   readonly modelContextWindowCache: Map<string, number | null>;
   modelContextWindowCacheLoaded: boolean;
-  /**
-   * Whether the session auto-compacts its context, from the config
-   * `compaction.auto` setting.
-   */
   compactsAutomatically: boolean;
-  /**
-   * Last emitted usage snapshot; dedup guard for re-broadcast
-   * `message.updated` events with unchanged cumulative counts.
-   */
   lastEmittedContextWindowUsage: ThreadTokenUsageSnapshot | undefined;
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
@@ -1069,32 +1018,20 @@ export function makeOpenCodeAdapter(
       },
     ) => writeNativeEvent(threadId, event).pipe(Effect.catchCause(() => Effect.void));
 
-    /** Context window for `providerID/modelID`, or `null` when unknown. */
     const resolveModelContextWindow = (
       context: OpenCodeSessionContext,
       providerID: string,
       modelID: string,
     ): number | null => context.modelContextWindowCache.get(`${providerID}/${modelID}`) ?? null;
 
-    /**
-     * Populate model context windows and the auto-compaction flag from the
-     * OpenCode config endpoints, scoped to the session directory so an
-     * externally-launched server reports the project's config rather than its
-     * own cwd. Runs lazily on the first token-bearing message; the sequential
-     * pump waits once per session, each probe bounded by
-     * `OPENCODE_CONTEXT_METADATA_PROBE_TIMEOUT_MS`, and later events read the
-     * cache. A failed or timed-out probe is marked loaded so it is not
-     * retried — the meter then shows token counts without a percentage. Each
-     * probe is handled independently so a slow or failed `config.get` does
-     * not discard a completed `config.providers` catalog, and vice versa.
-     */
+    // Lazy per-session probe for context window + auto-compaction. Best-effort
+    // with per-probe timeout; a failed probe is not retried.
     const loadContextUsageMetadata = Effect.fn("loadContextUsageMetadata")(function* (
       context: OpenCodeSessionContext,
     ) {
-      if (context.modelContextWindowCacheLoaded) {
-        return;
-      }
+      if (context.modelContextWindowCacheLoaded) return;
       context.modelContextWindowCacheLoaded = true;
+
       const [providersProbe, configProbe] = yield* Effect.all(
         [
           runOpenCodeSdk("config.providers", () =>
@@ -1110,46 +1047,27 @@ export function makeOpenCodeAdapter(
         ],
         { concurrency: "unbounded" },
       );
-      if (Option.isSome(providersProbe)) {
-        const providersExit = providersProbe.value;
-        if (Exit.isSuccess(providersExit)) {
-          for (const provider of providersExit.value.data?.providers ?? []) {
-            for (const [modelId, model] of Object.entries(provider.models ?? {})) {
-              const contextWindow = model.limit?.context;
-              context.modelContextWindowCache.set(
-                `${provider.id}/${modelId}`,
-                typeof contextWindow === "number" &&
-                  Number.isInteger(contextWindow) &&
-                  Number.isFinite(contextWindow) &&
-                  contextWindow > 0
-                  ? contextWindow
-                  : null,
-              );
-            }
+      if (Option.isSome(providersProbe) && Exit.isSuccess(providersProbe.value)) {
+        for (const provider of providersProbe.value.value.data?.providers ?? []) {
+          for (const [modelId, model] of Object.entries(provider.models ?? {})) {
+            const w = (model as { limit?: { context?: unknown } }).limit?.context;
+            context.modelContextWindowCache.set(
+              `${provider.id}/${modelId}`,
+              typeof w === "number" && Number.isInteger(w) && Number.isFinite(w) && w > 0
+                ? w
+                : null,
+            );
           }
         }
       }
-      if (Option.isSome(configProbe)) {
-        const configExit = configProbe.value;
-        if (Exit.isSuccess(configExit)) {
-          const auto = configExit.value.data?.compaction?.auto;
-          if (typeof auto === "boolean") {
-            context.compactsAutomatically = auto;
-          }
-        }
+      if (Option.isSome(configProbe) && Exit.isSuccess(configProbe.value)) {
+        const auto = configProbe.value.value.data?.compaction?.auto;
+        if (typeof auto === "boolean") context.compactsAutomatically = auto;
       }
     });
 
-    /**
-     * Emit a `thread.token-usage.updated` event from an assistant message's
-     * cumulative token counts. No-op when there are no tokens or the snapshot
-     * is unchanged (OpenCode can re-broadcast a completed message; re-emitting
-     * would persist a duplicate activity). Zero-total counts bail out before
-     * the metadata probes: OpenCode broadcasts freshly-created assistant
-     * messages with an all-zeros `tokens` object, and those can never build a
-     * snapshot, so making the sequential pump wait on a config round-trip for
-     * them would stall part deltas and turn completion.
-     */
+    // Emit deduped token-usage snapshot. Bails early on zero tokens so the
+    // sequential pump doesn't stall on config round-trips for empty broadcasts.
     const emitContextWindowUsage = Effect.fn("emitContextWindowUsage")(function* (
       context: OpenCodeSessionContext,
       tokens: OpenCodeAssistantTokenCounts,
@@ -1158,9 +1076,7 @@ export function makeOpenCodeAdapter(
       turnId: TurnId | undefined,
       raw: unknown,
     ) {
-      if (openCodeTokenTotal(tokens) <= 0) {
-        return;
-      }
+      if (openCodeTokenTotal(tokens) <= 0) return;
       yield* loadContextUsageMetadata(context).pipe(Effect.ignore);
       const usage = buildOpenCodeContextWindowUsage({
         tokens,
@@ -1170,16 +1086,11 @@ export function makeOpenCodeAdapter(
       if (
         usage === undefined ||
         isSameOpenCodeContextWindowUsage(context.lastEmittedContextWindowUsage, usage)
-      ) {
+      )
         return;
-      }
       context.lastEmittedContextWindowUsage = usage;
       yield* emit({
-        ...(yield* buildEventBase({
-          threadId: context.session.threadId,
-          turnId,
-          raw,
-        })),
+        ...(yield* buildEventBase({ threadId: context.session.threadId, turnId, raw })),
         type: "thread.token-usage.updated",
         payload: { usage },
       });
@@ -2161,15 +2072,8 @@ export function makeOpenCodeAdapter(
           event.type === "message.part.updated" ||
           (event.type === "message.updated" && event.properties.info.role === "assistant"));
       if (suppressInterruptedParentOutput) {
-        // Token usage is not display output — keep the meter accurate even
-        // for interrupted turns. Without this, an aborted assistant message
-        // that already carried the latest cumulative counts would be dropped
-        // and the meter would underreport until the next completed message.
-        // Use the interrupted turn's id, not the current `activeTurnId`:
-        // after an interrupt `activeTurnId` is empty (turnless) and once a
-        // follow-up prompt sets `awaitingBusyAfterInterruption` it is already
-        // the *next* turn, so stamping with `turnId` would misattribute the
-        // aborted counts or break revert.
+        // Still emit token usage for interrupted turns so the meter doesn't
+        // underreport. Stamp on the aborted turn, not the next one.
         if (
           event.type === "message.updated" &&
           event.properties.info.role === "assistant" &&
@@ -2189,8 +2093,6 @@ export function makeOpenCodeAdapter(
               event,
             );
           } else if (!context.awaitingBusyAfterInterruption) {
-            // No interrupted id known and not on the next turn — emit
-            // turnless as a last resort rather than dropping the meter.
             yield* emitContextWindowUsage(
               context,
               event.properties.info.tokens,
@@ -2252,8 +2154,7 @@ export function makeOpenCodeAdapter(
               }
               yield* emitAssistantTextDelta(context, part, turnId, event);
             }
-            // Assistant messages carry cumulative context-window token counts
-            // once complete; surface them as the live usage snapshot.
+            // Surface cumulative token counts as the live usage snapshot.
             if (event.properties.info.tokens !== undefined) {
               yield* emitContextWindowUsage(
                 context,
