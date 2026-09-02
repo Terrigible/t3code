@@ -349,11 +349,12 @@ ensure_remote_node_path() {
   prepend_path_if_dir "/usr/bin"
   prepend_path_if_dir "/bin"
 
-  if [ -z "\${VP_HOME:-}" ]; then
-    VP_HOME="$HOME/.vite-plus"
+  if [ -n "\${VP_HOME:-}" ]; then
+    prepend_path_if_dir "$VP_HOME/bin"
+  else
+    prepend_path_if_dir "$HOME/.vite-plus/bin"
+    prepend_path_if_dir "\${XDG_DATA_HOME:-$HOME/.local/share}/vite-plus/bin"
   fi
-  export VP_HOME
-  prepend_path_if_dir "$VP_HOME/bin"
 
   if [ -z "\${VOLTA_HOME:-}" ]; then
     VOLTA_HOME="$HOME/.volta"
