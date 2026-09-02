@@ -117,6 +117,8 @@ describe("ssh tunnel scripts", () => {
     assert.include(script, "function satisfiesSemverRange");
     assert.include(script, "satisfiesSemverRange(rawVersion, range)");
     assert.include(script, 'prepend_path_if_dir "$VOLTA_HOME/bin"');
+    assert.include(script, 'VP_HOME="$HOME/.vite-plus"');
+    assert.include(script, 'prepend_path_if_dir "$VP_HOME/bin"');
     assert.include(script, 'prepend_path_if_dir "$HOME/.asdf/shims"');
     assert.include(script, 'prepend_path_if_dir "$HOME/.local/share/mise/shims"');
     assert.include(script, 'eval "$(fnm env --shell bash)"');

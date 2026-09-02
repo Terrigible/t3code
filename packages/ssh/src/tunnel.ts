@@ -355,6 +355,12 @@ ensure_remote_node_path() {
   export VOLTA_HOME
   prepend_path_if_dir "$VOLTA_HOME/bin"
 
+  if [ -z "\${VP_HOME:-}" ]; then
+    VP_HOME="$HOME/.vite-plus"
+  fi
+  export VP_HOME
+  prepend_path_if_dir "$VP_HOME/bin"
+
   prepend_path_if_dir "$HOME/.asdf/shims"
   prepend_path_if_dir "$HOME/.asdf/bin"
   if [ ! -x "$HOME/.asdf/shims/node" ] && [ -s "$HOME/.asdf/asdf.sh" ]; then
