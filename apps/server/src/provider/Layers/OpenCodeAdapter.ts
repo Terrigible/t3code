@@ -182,6 +182,16 @@ export interface OpenCodeAssistantTokenCounts {
   readonly cache?: { readonly read?: number; readonly write?: number };
 }
 
+// Token input queued for ordered background usage emission. Carries its own
+// turn/raw so each emission is stamped like an inline one.
+interface PendingOpenCodeContextWindowUsage {
+  readonly tokens: OpenCodeAssistantTokenCounts;
+  readonly providerID: string;
+  readonly modelID: string;
+  readonly turnId: TurnId | undefined;
+  readonly raw: unknown;
+}
+
 function sanitizeCounter(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : 0;
 }
@@ -426,6 +436,7 @@ interface OpenCodeSessionContext {
   modelContextWindowCacheLoaded: boolean;
   compactsAutomatically: boolean;
   lastEmittedContextWindowUsage: ThreadTokenUsageSnapshot | undefined;
+  modelContextWindowQueue: Queue.Queue<PendingOpenCodeContextWindowUsage> | undefined;
   turnTokenUsage: OpenCodeTurnTokenUsageAccumulator | undefined;
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
@@ -1207,7 +1218,8 @@ export function makeOpenCodeAdapter(
 
     // Build a usage snapshot from the cached metadata and emit it unless
     // it duplicates the last emission. Reads the cache only — never touches
-    // the config probes, so it is safe to run inline in the sequential pump.
+    // the config probes. Runs on the session's background usage worker (see
+    // below), so concurrent emissions stay serialized in arrival order.
     const emitUsageSnapshot = Effect.fn("emitUsageSnapshot")(function* (
       context: OpenCodeSessionContext,
       tokens: OpenCodeAssistantTokenCounts,
@@ -1234,12 +1246,35 @@ export function makeOpenCodeAdapter(
       });
     });
 
+    // Ordered background worker for usage snapshots. Takes pending inputs
+    // FIFO so an older message can never overwrite newer usage: every
+    // snapshot is built from the metadata cache as of its own turn in line.
+    // Runs until the session scope closes.
+    const runContextWindowUsageWorker = Effect.fn("runContextWindowUsageWorker")(function* (
+      context: OpenCodeSessionContext,
+      queue: Queue.Queue<PendingOpenCodeContextWindowUsage>,
+    ) {
+      while (true) {
+        const pending = yield* Queue.take(queue);
+        yield* loadContextUsageMetadata(context).pipe(Effect.ignore);
+        yield* emitUsageSnapshot(
+          context,
+          pending.tokens,
+          pending.providerID,
+          pending.modelID,
+          pending.turnId,
+          pending.raw,
+        );
+      }
+    });
+
     // Emit deduped token-usage snapshot. Bails early on zero tokens so empty
-    // broadcasts spawn no probe. The metadata probe runs in a session-scoped
-    // background fiber — never inline: the first token-bearing message would
-    // otherwise stall the sequential event pump for up to the probe timeout
-    // while config.providers/config.get is wedged, delaying text deltas,
-    // approvals, and idle/completion events queued behind it.
+    // broadcasts spawn no probe or worker. Inputs are queued for the
+    // session's background worker — never probed inline: the first
+    // token-bearing message would otherwise stall the sequential event pump
+    // for up to the probe timeout while config.providers/config.get is
+    // wedged, delaying text deltas, approvals, and idle/completion events
+    // queued behind it.
     const emitContextWindowUsage = Effect.fn("emitContextWindowUsage")(function* (
       context: OpenCodeSessionContext,
       tokens: OpenCodeAssistantTokenCounts,
@@ -1249,15 +1284,28 @@ export function makeOpenCodeAdapter(
       raw: unknown,
     ) {
       if (openCodeTokenTotal(tokens) <= 0) return;
-      if (context.modelContextWindowCacheLoaded) {
-        yield* emitUsageSnapshot(context, tokens, providerID, modelID, turnId, raw);
+      const pending: PendingOpenCodeContextWindowUsage = {
+        tokens,
+        providerID,
+        modelID,
+        turnId,
+        raw,
+      };
+      const existing = context.modelContextWindowQueue;
+      if (existing !== undefined) {
+        yield* Queue.offer(existing, pending);
         return;
       }
-      yield* Effect.gen(function* () {
-        yield* loadContextUsageMetadata(context).pipe(Effect.ignore);
-        yield* emitUsageSnapshot(context, tokens, providerID, modelID, turnId, raw);
-      }).pipe(
-        Effect.catchCause(() => Effect.void),
+      // Single-flight: every caller runs on the sequential pump and the
+      // queue field is only assigned here, so exactly one worker exists per
+      // session and every input flows through it in arrival order.
+      const queue = yield* Queue.unbounded<PendingOpenCodeContextWindowUsage>();
+      context.modelContextWindowQueue = queue;
+      yield* Queue.offer(queue, pending);
+      yield* runContextWindowUsageWorker(context, queue).pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause) ? Effect.interrupt : Effect.void,
+        ),
         Effect.forkIn(context.sessionScope),
       );
     });
@@ -3205,6 +3253,7 @@ export function makeOpenCodeAdapter(
           modelContextWindowCacheLoaded: false,
           compactsAutomatically: true,
           lastEmittedContextWindowUsage: undefined,
+          modelContextWindowQueue: undefined,
           turnTokenUsage: undefined,
           activeTurnId: undefined,
           activeAgent: undefined,

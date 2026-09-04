@@ -7725,6 +7725,86 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("emits queued usage snapshots in arrival order when the probe is slow", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-token-usage-probe-order");
+      // The catalog probe hangs, so both token-bearing messages arrive while
+      // metadata is still pending. Snapshots must be emitted oldest-first:
+      // the first message's counters may not overwrite the second's newer
+      // counters once the probe completes.
+      runtimeMock.state.configProvidersHang = true;
+      runtimeMock.state.configGet = { compaction: { auto: false } };
+      const messageTokens = {
+        output: 100,
+        reasoning: 10,
+        cache: { read: 200, write: 50 },
+      };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-probe-order-a",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: { ...messageTokens, input: 1000 },
+            },
+          },
+        },
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-probe-order-b",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: { ...messageTokens, input: 2000 },
+            },
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(4),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      // Drive the clock past the probe timeout in small steps so the pump
+      // schedules the config.providers timer before it fires.
+      for (let elapsed = 0; elapsed < 3_000; elapsed += 100) {
+        yield* advanceTestClock(100);
+      }
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const usageEvents = events.filter((event) => event.type === "thread.token-usage.updated");
+      NodeAssert.deepEqual(
+        usageEvents.map((event) =>
+          event.type === "thread.token-usage.updated" ? event.payload.usage.usedTokens : -1,
+        ),
+        [1360, 2360],
+      );
+      const lastUsageEvent = usageEvents[usageEvents.length - 1];
+      if (lastUsageEvent?.type === "thread.token-usage.updated") {
+        NodeAssert.equal(lastUsageEvent.payload.usage.compactsAutomatically, false);
+      } else {
+        NodeAssert.fail("expected a final thread.token-usage.updated event");
+      }
+    }),
+  );
+
   it.effect("skips metadata probes for zero-token assistant broadcasts", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
