@@ -1205,9 +1205,10 @@ export function makeOpenCodeAdapter(
       }
     });
 
-    // Emit deduped token-usage snapshot. Bails early on zero tokens so the
-    // sequential pump doesn't stall on config round-trips for empty broadcasts.
-    const emitContextWindowUsage = Effect.fn("emitContextWindowUsage")(function* (
+    // Build a usage snapshot from the cached metadata and emit it unless
+    // it duplicates the last emission. Reads the cache only — never touches
+    // the config probes, so it is safe to run inline in the sequential pump.
+    const emitUsageSnapshot = Effect.fn("emitUsageSnapshot")(function* (
       context: OpenCodeSessionContext,
       tokens: OpenCodeAssistantTokenCounts,
       providerID: string,
@@ -1215,8 +1216,6 @@ export function makeOpenCodeAdapter(
       turnId: TurnId | undefined,
       raw: unknown,
     ) {
-      if (openCodeTokenTotal(tokens) <= 0) return;
-      yield* loadContextUsageMetadata(context).pipe(Effect.ignore);
       const usage = buildOpenCodeContextWindowUsage({
         tokens,
         modelContextWindow: resolveModelContextWindow(context, providerID, modelID),
@@ -1233,6 +1232,34 @@ export function makeOpenCodeAdapter(
         type: "thread.token-usage.updated",
         payload: { usage },
       });
+    });
+
+    // Emit deduped token-usage snapshot. Bails early on zero tokens so empty
+    // broadcasts spawn no probe. The metadata probe runs in a session-scoped
+    // background fiber — never inline: the first token-bearing message would
+    // otherwise stall the sequential event pump for up to the probe timeout
+    // while config.providers/config.get is wedged, delaying text deltas,
+    // approvals, and idle/completion events queued behind it.
+    const emitContextWindowUsage = Effect.fn("emitContextWindowUsage")(function* (
+      context: OpenCodeSessionContext,
+      tokens: OpenCodeAssistantTokenCounts,
+      providerID: string,
+      modelID: string,
+      turnId: TurnId | undefined,
+      raw: unknown,
+    ) {
+      if (openCodeTokenTotal(tokens) <= 0) return;
+      if (context.modelContextWindowCacheLoaded) {
+        yield* emitUsageSnapshot(context, tokens, providerID, modelID, turnId, raw);
+        return;
+      }
+      yield* Effect.gen(function* () {
+        yield* loadContextUsageMetadata(context).pipe(Effect.ignore);
+        yield* emitUsageSnapshot(context, tokens, providerID, modelID, turnId, raw);
+      }).pipe(
+        Effect.catchCause(() => Effect.void),
+        Effect.forkIn(context.sessionScope),
+      );
     });
 
     const cancelIdleReconciliation = Effect.fn("cancelIdleReconciliation")(function* (

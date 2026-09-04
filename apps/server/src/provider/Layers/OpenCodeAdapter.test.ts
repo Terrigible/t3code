@@ -7626,6 +7626,105 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("does not stall the event pump while usage metadata probes hang", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-token-usage-pump-not-blocked");
+      // Both probes hang forever: the usage emit must move to a background
+      // fiber so the session.updated queued behind the token-bearing
+      // message.updated still flows through the sequential pump.
+      runtimeMock.state.configProvidersHang = true;
+      runtimeMock.state.configGetHang = true;
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-pump-not-blocked",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: {
+                input: 1000,
+                output: 100,
+                reasoning: 10,
+                cache: { read: 200, write: 50 },
+              },
+            },
+          },
+        },
+        {
+          type: "session.updated",
+          properties: {
+            info: {
+              id: "http://127.0.0.1:9999/session",
+              title: "Real thread title while probes hang",
+            },
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      // Stay under the probe timeout: the queued session.updated must be
+      // delivered while the probes are still wedged.
+      for (let elapsed = 0; elapsed < 1_000; elapsed += 100) {
+        yield* advanceTestClock(100);
+      }
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(
+        events.map((event) => event.type),
+        ["session.started", "thread.started", "thread.metadata.updated"],
+      );
+      // Both config round-trips were attempted, so the probe is in flight
+      // while the pump already moved on — and no usage event could have
+      // been emitted before its probe finishes.
+      NodeAssert.deepEqual(runtimeMock.state.configProbeDirectories, [
+        process.cwd(),
+        process.cwd(),
+      ]);
+
+      const usageFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      // Drive the clock past the probe timeout so the background emit fires,
+      // then assert the deferred usage delivery.
+      for (let elapsed = 1_000; elapsed < 3_000; elapsed += 100) {
+        yield* advanceTestClock(100);
+      }
+
+      const usageEvents = Array.from(
+        yield* Fiber.join(usageFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.equal(usageEvents.length, 1);
+      const usageEvent = usageEvents[0];
+      NodeAssert.ok(usageEvent);
+      if (usageEvent.type === "thread.token-usage.updated") {
+        NodeAssert.equal(usageEvent.payload.usage.usedTokens, 1360);
+        NodeAssert.equal("maxTokens" in usageEvent.payload.usage, false);
+      } else {
+        NodeAssert.fail(`expected thread.token-usage.updated, got ${usageEvent.type}`);
+      }
+    }),
+  );
+
   it.effect("skips metadata probes for zero-token assistant broadcasts", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
