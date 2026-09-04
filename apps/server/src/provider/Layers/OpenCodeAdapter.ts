@@ -1219,7 +1219,10 @@ export function makeOpenCodeAdapter(
     // Build a usage snapshot from the cached metadata and emit it unless
     // it duplicates the last emission. Reads the cache only — never touches
     // the config probes. Runs on the session's background usage worker (see
-    // below), so concurrent emissions stay serialized in arrival order.
+    // below), the sole writer of lastEmittedContextWindowUsage, so the
+    // check-then-stamp stays atomic. Stamp only after a successful emit: a
+    // failed emit must not mark the snapshot published, or an identical
+    // re-broadcast would dedupe against it and the meter would never show it.
     const emitUsageSnapshot = Effect.fn("emitUsageSnapshot")(function* (
       context: OpenCodeSessionContext,
       tokens: OpenCodeAssistantTokenCounts,
@@ -1238,12 +1241,12 @@ export function makeOpenCodeAdapter(
         isSameOpenCodeContextWindowUsage(context.lastEmittedContextWindowUsage, usage)
       )
         return;
-      context.lastEmittedContextWindowUsage = usage;
       yield* emit({
         ...(yield* buildEventBase({ threadId: context.session.threadId, turnId, raw })),
         type: "thread.token-usage.updated",
         payload: { usage },
       });
+      context.lastEmittedContextWindowUsage = usage;
     });
 
     // Ordered background worker for usage snapshots. Takes pending inputs
@@ -1251,8 +1254,9 @@ export function makeOpenCodeAdapter(
     // snapshot is built from the metadata cache as of its own turn in line.
     // Failures are handled per iteration — one bad snapshot must not end the
     // worker, or the queue would stay set with nothing reading it and the
-    // meter would go silent for the rest of the session. Only interruption
-    // escapes to end the loop when the session scope closes.
+    // meter would go silent for the rest of the session. Any interruption —
+    // pure or mixed with failures — still propagates so session teardown
+    // never waits on this loop.
     const runContextWindowUsageWorker = Effect.fn("runContextWindowUsageWorker")(function* (
       context: OpenCodeSessionContext,
       queue: Queue.Queue<PendingOpenCodeContextWindowUsage>,
@@ -1271,7 +1275,7 @@ export function makeOpenCodeAdapter(
           );
         }).pipe(
           Effect.catchCause((cause) =>
-            Cause.hasInterruptsOnly(cause) ? Effect.interrupt : Effect.void,
+            Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.void,
           ),
         );
       }
@@ -1312,9 +1316,7 @@ export function makeOpenCodeAdapter(
       context.modelContextWindowQueue = queue;
       yield* Queue.offer(queue, pending);
       yield* runContextWindowUsageWorker(context, queue).pipe(
-        Effect.catchCause((cause) =>
-          Cause.hasInterruptsOnly(cause) ? Effect.interrupt : Effect.void,
-        ),
+        Effect.catchCause((cause) => (Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.void)),
         Effect.forkIn(context.sessionScope),
       );
     });

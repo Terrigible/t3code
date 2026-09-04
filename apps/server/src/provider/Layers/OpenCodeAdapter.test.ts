@@ -7907,6 +7907,156 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("re-emits identical counters when the first snapshot emission fails", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-opencode-token-usage-retry-identical");
+      runtimeMock.state.configProviders = {
+        providers: [
+          {
+            id: "opencode",
+            models: {
+              "gpt-5.4": { limit: { context: 200_000, output: 16_384 } },
+            },
+          },
+        ],
+      };
+      const messageTokens = {
+        input: 1000,
+        output: 100,
+        reasoning: 10,
+        cache: { read: 200, write: 50 },
+      };
+      // OpenCode re-broadcasts the same counters. If the first emission dies
+      // after stamping lastEmitted, the retry looks like a duplicate and the
+      // meter never publishes the snapshot — so both broadcasts must carry
+      // identical tokens here.
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-retry-identical-a",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: messageTokens,
+            },
+          },
+        },
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-retry-identical-b",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: messageTokens,
+            },
+          },
+        },
+      ];
+
+      // Fail the third event-id allocation: the first two belong to
+      // session.started/thread.started, so the first usage snapshot dies
+      // while building its event and the identical retry must still publish.
+      let uuidCalls = 0;
+      const nodeCrypto = yield* Crypto.Crypto;
+      const gatedCrypto = {
+        ...nodeCrypto,
+        randomUUIDv4: Effect.suspend(() => {
+          uuidCalls += 1;
+          if (uuidCalls === 3) {
+            return Effect.die(new Error("retry-identical-test injected uuid failure"));
+          }
+          return nodeCrypto.randomUUIDv4;
+        }),
+      } satisfies Crypto.Crypto;
+      const adapter = yield* makeOpenCodeAdapter(openCodeAdapterTestSettings).pipe(
+        Effect.provideService(Crypto.Crypto, gatedCrypto),
+      );
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      // Without stamp-after-emit the failed snapshot is already recorded, so
+      // the identical retry dedupes and take(3) never completes.
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(
+        events.map((event) => event.type),
+        ["session.started", "thread.started", "thread.token-usage.updated"],
+      );
+      const usageEvent = events[2];
+      NodeAssert.ok(usageEvent);
+      if (usageEvent.type === "thread.token-usage.updated") {
+        NodeAssert.equal(usageEvent.payload.usage.usedTokens, 1360);
+        NodeAssert.equal(usageEvent.payload.usage.maxTokens, 200_000);
+      } else {
+        NodeAssert.fail(`expected thread.token-usage.updated, got ${usageEvent.type}`);
+      }
+    }),
+  );
+
+  it.effect("stops the session while the usage probe is wedged", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-token-usage-stop-while-probing");
+      // Both probes hang forever so the background usage worker parks
+      // mid-probe. Stopping the session must interrupt it and complete
+      // without advancing the clock past the probe timeout.
+      runtimeMock.state.configProvidersHang = true;
+      runtimeMock.state.configGetHang = true;
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-stop-while-probing",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: {
+                input: 1000,
+                output: 100,
+                reasoning: 10,
+                cache: { read: 200, write: 50 },
+              },
+            },
+          },
+        },
+      ];
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      // Wait until the background worker attempts both config round-trips
+      // (no clock advance needed — invoking the mocks takes no timers), so
+      // the worker is parked mid-probe when teardown begins.
+      while (runtimeMock.state.configProbeDirectories.length < 2) {
+        yield* Effect.yieldNow;
+      }
+
+      yield* adapter.stopSession(threadId);
+      NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+    }),
+  );
+
   it.effect("skips metadata probes for zero-token assistant broadcasts", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
