@@ -7805,6 +7805,108 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("keeps emitting usage snapshots after a snapshot emission fails", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-opencode-token-usage-worker-survives-failure");
+      runtimeMock.state.configProviders = {
+        providers: [
+          {
+            id: "opencode",
+            models: {
+              "gpt-5.4": { limit: { context: 200_000, output: 16_384 } },
+            },
+          },
+        ],
+      };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-worker-survives-a",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: {
+                input: 1000,
+                output: 100,
+                reasoning: 10,
+                cache: { read: 200, write: 50 },
+              },
+            },
+          },
+        },
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "msg-worker-survives-b",
+              role: "assistant",
+              providerID: "opencode",
+              modelID: "gpt-5.4",
+              tokens: {
+                input: 2000,
+                output: 100,
+                reasoning: 10,
+                cache: { read: 200, write: 50 },
+              },
+            },
+          },
+        },
+      ];
+
+      // Fail the third event-id allocation: the first two belong to
+      // session.started/thread.started, so the first usage snapshot's
+      // buildEventBase dies while the second snapshot must still flow.
+      let uuidCalls = 0;
+      const nodeCrypto = yield* Crypto.Crypto;
+      const gatedCrypto = {
+        ...nodeCrypto,
+        randomUUIDv4: Effect.suspend(() => {
+          uuidCalls += 1;
+          if (uuidCalls === 3) {
+            return Effect.die(new Error("worker-survival-test injected uuid failure"));
+          }
+          return nodeCrypto.randomUUIDv4;
+        }),
+      } satisfies Crypto.Crypto;
+      const adapter = yield* makeOpenCodeAdapter(openCodeAdapterTestSettings).pipe(
+        Effect.provideService(Crypto.Crypto, gatedCrypto),
+      );
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      // Without per-iteration recovery the worker dies on the first failure
+      // and the second snapshot never arrives, so take(3) never completes.
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(
+        events.map((event) => event.type),
+        ["session.started", "thread.started", "thread.token-usage.updated"],
+      );
+      const usageEvent = events[2];
+      NodeAssert.ok(usageEvent);
+      if (usageEvent.type === "thread.token-usage.updated") {
+        NodeAssert.equal(usageEvent.payload.usage.usedTokens, 2360);
+        NodeAssert.equal(usageEvent.payload.usage.maxTokens, 200_000);
+      } else {
+        NodeAssert.fail(`expected thread.token-usage.updated, got ${usageEvent.type}`);
+      }
+    }),
+  );
+
   it.effect("skips metadata probes for zero-token assistant broadcasts", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

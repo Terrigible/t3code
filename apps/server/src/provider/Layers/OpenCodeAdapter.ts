@@ -1249,21 +1249,30 @@ export function makeOpenCodeAdapter(
     // Ordered background worker for usage snapshots. Takes pending inputs
     // FIFO so an older message can never overwrite newer usage: every
     // snapshot is built from the metadata cache as of its own turn in line.
-    // Runs until the session scope closes.
+    // Failures are handled per iteration — one bad snapshot must not end the
+    // worker, or the queue would stay set with nothing reading it and the
+    // meter would go silent for the rest of the session. Only interruption
+    // escapes to end the loop when the session scope closes.
     const runContextWindowUsageWorker = Effect.fn("runContextWindowUsageWorker")(function* (
       context: OpenCodeSessionContext,
       queue: Queue.Queue<PendingOpenCodeContextWindowUsage>,
     ) {
       while (true) {
         const pending = yield* Queue.take(queue);
-        yield* loadContextUsageMetadata(context).pipe(Effect.ignore);
-        yield* emitUsageSnapshot(
-          context,
-          pending.tokens,
-          pending.providerID,
-          pending.modelID,
-          pending.turnId,
-          pending.raw,
+        yield* Effect.gen(function* () {
+          yield* loadContextUsageMetadata(context).pipe(Effect.ignore);
+          yield* emitUsageSnapshot(
+            context,
+            pending.tokens,
+            pending.providerID,
+            pending.modelID,
+            pending.turnId,
+            pending.raw,
+          );
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause) ? Effect.interrupt : Effect.void,
+          ),
         );
       }
     });
